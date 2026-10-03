@@ -352,7 +352,7 @@ struct LitMix {
     ht: Vec<Vec<Ctr>>,
     h_mask: usize,
     /// Weight banks, selected by: bitpos x matched x ctx confidence; prev byte x matched;
-    /// partial byte x matched; order-2 hash bucket.
+    /// partial byte x matched; word hash bucket.
     wb: [Vec<[i32; MIX_N]>; NB],
     sets: [usize; NB],
     prs: [i32; NB],
@@ -459,7 +459,7 @@ impl LitMix {
         let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
         self.set = set * 9 + conf;
         let m = (set >= 8) as usize;
-        self.sets = [self.set, ((i1 >> 8) << 1) | m, ((node as usize & 0xFF) << 1) | m, (hs[0] >> 22) as usize];
+        self.sets = [self.set, ((i1 >> 8) << 1) | m, ((node as usize & 0xFF) << 1) | m, (hs[4] >> 22) as usize];
         for b in 0..NB {
             let w = &self.wb[b][self.sets[b]];
             let mut dot = 0i64;
