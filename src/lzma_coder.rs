@@ -65,6 +65,14 @@ impl Enc {
         while self.range < TOP { self.range <<= 8; self.shift_low(); }
     }
 
+    /// Code `bit` with explicit P(bit==1) = p1 / 4096 (p1 in 1..4095).
+    #[inline]
+    fn bit_p(&mut self, p1: u32, bit: u32) {
+        let bound = (self.range >> 12) * (4096 - p1);
+        if bit == 0 { self.range = bound; } else { self.low += bound as u64; self.range -= bound; }
+        while self.range < TOP { self.range <<= 8; self.shift_low(); }
+    }
+
     fn direct(&mut self, v: u32, n: usize) {
         for i in (0..n).rev() {
             self.range >>= 1;
@@ -108,7 +116,15 @@ impl<'a> Dec<'a> {
             *p -= *p >> MOVE_BITS;
             1
         };
-        if self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
+        while self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
+        b
+    }
+
+    #[inline]
+    fn bit_p(&mut self, p1: u32) -> u32 {
+        let bound = (self.range >> 12) * (4096 - p1);
+        let b = if self.code < bound { self.range = bound; 0 } else { self.code -= bound; self.range -= bound; 1 };
+        while self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
         b
     }
 
@@ -118,7 +134,7 @@ impl<'a> Dec<'a> {
             self.range >>= 1;
             let b = if self.code >= self.range { self.code -= self.range; 1 } else { 0 };
             v = (v << 1) | b;
-            if self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
+            while self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
         }
         v
     }
@@ -208,10 +224,11 @@ struct Model {
     spec: Vec<Vec<u16>>, // per slot < END_POS_MODEL
     align: [u16; 1 << ALIGN_BITS],
     len: LenModel, rep_len: LenModel,
+    mix: LitMix,
 }
 
 impl Model {
-    fn new(p: &Params) -> Self {
+    fn new(p: &Params, input_len: usize) -> Self {
         let pos_states = 1usize << p.pb;
         let mut spec = Vec::with_capacity(END_POS_MODEL);
         for s in 0..END_POS_MODEL {
@@ -227,6 +244,7 @@ impl Model {
             slot: [[PROB_INIT; NUM_SLOTS]; NUM_LEN_STATES],
             spec, align: [PROB_INIT; 1 << ALIGN_BITS],
             len: LenModel::new(pos_states), rep_len: LenModel::new(pos_states),
+            mix: LitMix::new(input_len),
         }
     }
 
@@ -248,10 +266,134 @@ fn dist_slot(d0: u32) -> usize {
     ((n << 1) | ((d0 >> (n - 1)) & 1)) as usize
 }
 
+
+// ---------------------------------------------------------------- literal mixing
+
+trait BitIO { fn code(&mut self, p1: u32, bit: u32) -> u32; }
+impl BitIO for Enc { #[inline] fn code(&mut self, p1: u32, bit: u32) -> u32 { self.bit_p(p1, bit); bit } }
+impl<'a> BitIO for Dec<'a> { #[inline] fn code(&mut self, p1: u32, _bit: u32) -> u32 { self.bit_p(p1) } }
+
+#[inline]
+fn upd(p: &mut u16, bit: u32) {
+    if bit == 0 { *p += ((1 << PROB_BITS) - *p) >> MOVE_BITS; } else { *p -= *p >> MOVE_BITS; }
+}
+
+fn squash_i(d: i32) -> i32 {
+    const T: [i32; 33] = [1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047, 2549,
+                          2994, 3348, 3607, 3785, 3901, 3975, 4022, 4050, 4068, 4079, 4085, 4089, 4092, 4093, 4094];
+    if d > 2047 { return 4095; }
+    if d < -2047 { return 1; }
+    let w = d & 127;
+    let i = ((d >> 7) + 16) as usize;
+    (T[i] * (128 - w) + T[i + 1] * w + 64) >> 7
+}
+
+/// Adaptive bit counter: P(1) in 16 bits, adaptation rate 1/(n+1.5) until n hits the limit.
+#[derive(Clone, Copy)]
+struct Ctr { p: u16, n: u16 }
+const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
+const CTR_LIMIT: u16 = 30;
+const MIX_N: usize = 4;
+const MIX_LR: i32 = 6;
+const MIX_SHIFT: u32 = 14;
+
+struct LitMix {
+    squash: Vec<i32>,   // index d+2048
+    stretch: Vec<i32>,  // index p (12-bit)
+    recip: [i32; 1024],
+    o1: Vec<Ctr>,
+    o2: Vec<Ctr>,
+    o2_mask: usize,
+    w: Vec<[i32; MIX_N]>,
+    st: [i32; MIX_N],
+    pr: i32,
+    set: usize,
+    i1: usize,
+    i2: usize,
+}
+
+impl LitMix {
+    fn new(input_len: usize) -> Self {
+        let squash: Vec<i32> = (-2048..2048).map(squash_i).collect();
+        let mut stretch = vec![0i32; 4096];
+        let mut pi = 0usize;
+        for x in -2047..=2047 {
+            let v = squash_i(x) as usize;
+            for j in pi..=v { stretch[j] = x; }
+            pi = v + 1;
+        }
+        for j in pi..4096 { stretch[j] = 2047; }
+        let mut recip = [0i32; 1024];
+        for n in 0..1024 { recip[n] = (65536.0 / (n as f64 + 1.5)) as i32; }
+        let o2_bits = ((input_len * 8).max(1 << 16).next_power_of_two().trailing_zeros()).min(22);
+        LitMix {
+            squash, stretch, recip,
+            o1: vec![CTR_INIT; 1 << 16],
+            o2: vec![CTR_INIT; 1 << o2_bits],
+            o2_mask: (1 << o2_bits) - 1,
+            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 0]; 16],
+            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0,
+        }
+    }
+
+    #[inline]
+    fn sq(&self, d: i32) -> i32 { self.squash[(d.clamp(-2047, 2047) + 2048) as usize] }
+
+    #[inline]
+    fn predict(&mut self, lz_p1: u32, i1: usize, i2: usize, set: usize) -> u32 {
+        self.i1 = i1; self.i2 = i2 & self.o2_mask; self.set = set;
+        self.st = [
+            self.stretch[lz_p1.clamp(1, 4095) as usize],
+            self.stretch[(self.o1[self.i1].p >> 4) as usize],
+            self.stretch[(self.o2[self.i2].p >> 4) as usize],
+            256,
+        ];
+        let w = &self.w[set];
+        let mut dot: i64 = 0;
+        for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; }
+        self.pr = self.sq((dot >> 16) as i32).clamp(1, 4095);
+        self.pr as u32
+    }
+
+    #[inline]
+    fn update(&mut self, bit: u32) {
+        let err = (((bit as i32) << 12) - self.pr) * MIX_LR;
+        let w = &mut self.w[self.set];
+        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        let target = if bit != 0 { 65535 } else { 0 };
+        for c in [&mut self.o1[self.i1], &mut self.o2[self.i2]] {
+            let r = self.recip[c.n as usize];
+            c.p = (c.p as i32 + (((target - c.p as i32) * r) >> 16)) as u16;
+            if c.n < CTR_LIMIT { c.n += 1; }
+        }
+    }
+}
+
+/// Code one literal (encode `byte`, or decode and return it). `matched`: byte at rep0 after a match.
+fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev: u8, prev2: u8, matched: Option<u32>) -> u8 {
+    let h1 = (prev as usize) << 8;
+    let h2 = (((prev2 as u32) << 8 | prev as u32).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
+    let mut node = 1u32;
+    let mut offs = 0x100u32;
+    let mut mb = matched.unwrap_or(0);
+    let mset = if matched.is_some() { 8 } else { 0 };
+    for k in (0..8).rev() {
+        let lz_idx = if matched.is_some() { mb <<= 1; offs + (mb & offs) + node } else { node } as usize;
+        let lz_p1 = (1u32 << PROB_BITS) - m.lit[base + lz_idx] as u32;
+        let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, mset + 7 - k);
+        let bit = io.code(p, (byte >> k) & 1);
+        upd(&mut m.lit[base + lz_idx], bit);
+        m.mix.update(bit);
+        if matched.is_some() { let mbit = mb & offs; if bit == 0 { offs &= !mbit; } else { offs &= mbit; } }
+        node = (node << 1) | bit;
+    }
+    node as u8
+}
+
 // ---------------------------------------------------------------- encode / decode
 
 pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
-    let mut m = Model::new(p);
+    let mut m = Model::new(p, input.len());
     let mut e = Enc::new();
     let mut state = 0usize;
     let mut rep = [0u32; 4];
@@ -263,26 +405,10 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
             Op::Lit(b) => {
                 e.bit(&mut m.is_match[(state << p.pb) + ps], 0);
                 let prev = if pos > 0 { input[pos - 1] } else { 0 };
+                let prev2 = if pos > 1 { input[pos - 2] } else { 0 };
                 let base = m.lit_base(pos, prev);
-                let probs = &mut m.lit[base..base + 0x300];
-                let mut sym = b as u32 | 0x100;
-                if state >= 7 {
-                    let mut mb = input[pos - rep[0] as usize] as u32;
-                    let mut offs = 0x100u32;
-                    loop {
-                        mb <<= 1;
-                        e.bit(&mut probs[(offs + (mb & offs) + (sym >> 8)) as usize], (sym >> 7) & 1);
-                        sym <<= 1;
-                        offs &= !(mb ^ sym);
-                        if sym >= 0x10000 { break; }
-                    }
-                } else {
-                    loop {
-                        e.bit(&mut probs[(sym >> 8) as usize], (sym >> 7) & 1);
-                        sym <<= 1;
-                        if sym >= 0x10000 { break; }
-                    }
-                }
+                let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
+                code_lit(&mut e, &mut m, b as u32, base, prev, prev2, matched);
                 state = st_lit(state);
                 pos += 1;
             }
@@ -337,7 +463,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
 }
 
 pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, String> {
-    let mut m = Model::new(p);
+    let mut m = Model::new(p, orig_len);
     let mut d = Dec::new(data);
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut state = 0usize;
@@ -348,26 +474,10 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
         let ps = pos & m.pb_mask;
         if d.bit(&mut m.is_match[(state << p.pb) + ps]) == 0 {
             let prev = if pos > 0 { out[pos - 1] } else { 0 };
+            let prev2 = if pos > 1 { out[pos - 2] } else { 0 };
             let base = m.lit_base(pos, prev);
-            let probs = &mut m.lit[base..base + 0x300];
-            let mut sym = 1u32;
-            if state >= 7 {
-                let mut mb = out[pos - rep[0] as usize] as u32;
-                let mut offs = 0x100u32;
-                loop {
-                    mb <<= 1;
-                    let bit = mb & offs;
-                    let b = d.bit(&mut probs[(offs + bit + sym) as usize]);
-                    sym = (sym << 1) | b;
-                    if b == 0 { offs &= !bit; } else { offs &= bit; }
-                    if sym >= 0x100 { break; }
-                }
-            } else {
-                loop {
-                    sym = (sym << 1) | d.bit(&mut probs[sym as usize]);
-                    if sym >= 0x100 { break; }
-                }
-            }
+            let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
+            let sym = code_lit(&mut d, &mut m, 0, base, prev, prev2, matched);
             out.push(sym as u8);
             state = st_lit(state);
             continue;
