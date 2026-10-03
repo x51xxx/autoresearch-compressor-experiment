@@ -320,7 +320,7 @@ struct Lc { h: [u32; NH], exp: u32, mlen: u32 }
 /// `at(buf, pos)` catches up on the bytes before `pos` (all known to both sides).
 struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64, mm: Vec<u32>, mm_shift: u32, mptr: usize, mlen: u32 }
 
-const MM_MIN: usize = 6;
+const MM_MIN: usize = 5;
 
 impl Ctx {
     fn new(input_len: usize) -> Self {
