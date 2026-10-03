@@ -352,12 +352,14 @@ struct LitMix {
     h_mask: usize,
     w: Vec<[i32; MIX_N]>,
     w2: Vec<[i32; MIX_N]>, // second weight bank selected by prev byte
+    w3: Vec<[i32; MIX_N]>, // third weight bank selected by partial byte (node)
+    pr3: i32, set3: usize,
     st: [i32; MIX_N],
     pr: i32,
     pr1: i32, pr2: i32,
     set: usize, set2: usize,
-    wf: Vec<[i32; 3]>, // final 2-input mixer, selected by bit position x matched
-    fin: [i32; 3], fset: usize,
+    wf: Vec<[i32; 4]>, // final 3-input mixer, selected by bit position x matched
+    fin: [i32; 4], fset: usize,
     nbits: u32, // coded literal bits, for the decaying mixer learning rate
     i1: usize,
     hi: [usize; NH],
@@ -392,8 +394,9 @@ impl LitMix {
             h_mask: (1 << h_bits) - 1,
             w: vec![w0; 16 * 9],
             w2: vec![w0; 256 * 2],
+            w3: vec![w0; 256 * 2], pr3: 2048, set3: 0,
             st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0,
-            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
+            wf: vec![[21845, 21845, 21845, 0]; 16], fin: [0; 4], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -456,16 +459,21 @@ impl LitMix {
         let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
         self.set = set * 9 + conf;
         self.set2 = ((i1 >> 8) << 1) | (set >= 8) as usize;
-        let (w, w2) = (&self.w[self.set], &self.w2[self.set2]);
-        let (mut dot, mut dot2) = (0i64, 0i64);
-        for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; dot2 += self.st[k] as i64 * w2[k] as i64; }
-        let (d1, d2) = ((dot >> 16) as i32, (dot2 >> 16) as i32);
+        self.set3 = ((node as usize & 0xFF) << 1) | (set >= 8) as usize;
+        let (w, w2, w3) = (&self.w[self.set], &self.w2[self.set2], &self.w3[self.set3]);
+        let (mut dot, mut dot2, mut dot3) = (0i64, 0i64, 0i64);
+        for k in 0..MIX_N {
+            let x = self.st[k] as i64;
+            dot += x * w[k] as i64; dot2 += x * w2[k] as i64; dot3 += x * w3[k] as i64;
+        }
+        let (d1, d2, d3) = ((dot >> 16) as i32, (dot2 >> 16) as i32, (dot3 >> 16) as i32);
         self.pr1 = self.sq(d1).clamp(1, 4095);
         self.pr2 = self.sq(d2).clamp(1, 4095);
-        self.fin = [d1.clamp(-2047, 2047), d2.clamp(-2047, 2047), 256];
+        self.pr3 = self.sq(d3).clamp(1, 4095);
+        self.fin = [d1.clamp(-2047, 2047), d2.clamp(-2047, 2047), d3.clamp(-2047, 2047), 256];
         self.fset = set;
         let wf = &self.wf[set];
-        let df = (self.fin[0] as i64 * wf[0] as i64 + self.fin[1] as i64 * wf[1] as i64 + self.fin[2] as i64 * wf[2] as i64) >> 16;
+        let df = (0..4).map(|k| self.fin[k] as i64 * wf[k] as i64).sum::<i64>() >> 16;
         self.pr = self.sq(df as i32).clamp(1, 4095);
         // APM / SSE refinement in context (prev byte, partial literal)
         let sv = self.stretch[self.pr as usize] + 2048;
@@ -490,7 +498,10 @@ impl LitMix {
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let errf = (((bit as i32) << 12) - self.pr) * FIN_LR;
         let wf = &mut self.wf[self.fset];
-        for k in 0..3 { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
+        for k in 0..4 { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
+        let err = (((bit as i32) << 12) - self.pr3) * lr;
+        let w = &mut self.w3[self.set3];
+        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let err = (((bit as i32) << 12) - self.pr2) * lr;
         let w = &mut self.w2[self.set2];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
