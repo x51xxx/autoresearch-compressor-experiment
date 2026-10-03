@@ -297,6 +297,7 @@ const NH: usize = 6;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
 const MIX_LR: i32 = 6;
 const FIN_LR: i32 = 2;
+const MIX_LR0: i32 = 3; // extra learning rate at the start, decays over ~256K bits
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
 const APM2_BITS: u32 = 16;
@@ -346,6 +347,7 @@ struct LitMix {
     set: usize, set2: usize,
     wf: Vec<[i32; 3]>, // final 2-input mixer, selected by bit position x matched
     fin: [i32; 3], fset: usize,
+    nbits: u32, // coded literal bits, for the decaying mixer learning rate
     i1: usize,
     hi: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
@@ -379,7 +381,7 @@ impl LitMix {
             w: vec![w0; 16 * 9],
             w2: vec![w0; 256 * 2],
             st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0,
-            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, i1: 0, hi: [0; NH],
+            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, nbits: 0, i1: 0, hi: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -450,13 +452,15 @@ impl LitMix {
 
     #[inline]
     fn update(&mut self, bit: u32) {
-        let err = (((bit as i32) << 12) - self.pr1) * MIX_LR;
+        self.nbits = self.nbits.saturating_add(1);
+        let lr = MIX_LR + ((MIX_LR0 << 16) / ((1 << 16) + self.nbits as i32 / 4));
+        let err = (((bit as i32) << 12) - self.pr1) * lr;
         let w = &mut self.w[self.set];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let errf = (((bit as i32) << 12) - self.pr) * FIN_LR;
         let wf = &mut self.wf[self.fset];
         for k in 0..3 { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
-        let err = (((bit as i32) << 12) - self.pr2) * MIX_LR;
+        let err = (((bit as i32) << 12) - self.pr2) * lr;
         let w = &mut self.w2[self.set2];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
