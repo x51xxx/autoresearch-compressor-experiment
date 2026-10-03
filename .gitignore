@@ -1,0 +1,10 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Test data (large files)
+data/enwik8
+data/enwik9
+
+# Autoresearch session files
+autoresearch.jsonl
