@@ -11,7 +11,7 @@ Optimize a pure Rust LZ77+Huffman compressor for compression ratio (primary). 12
 `./autoresearch.sh`
 
 ## Current Best
-**Ratio: 0.208087** (wave 4, run 21) - compress 6.5 s, decompress 167 ms for the 12-file corpus.
+**Ratio: 0.204114** (wave 4, run 23) - compress 8.0 s, decompress 360 ms for the 12-file corpus.
 Beats brotli-11 (0.2167), xz/LZMA raw lc=3 (0.2156), zstd-19, gzip-9 (0.303). Wave 4 started at 0.220861.
 
 ## Wave 4 protocol (segment 3 in autoresearch.jsonl)
@@ -24,8 +24,8 @@ Keep rule: ratio must improve; compress_µs must not grow by more than 25%. Deco
 - **Rep-offsets**: REP0-REP3 in the distance alphabet; DP tracks REP0-REP2 with hardcoded 2/3/4-bit prices.
 - **Context**: 9 byte classes (prev byte), adaptive 1 vs 9 tables by entropy estimate.
 - **Window**: 8 MB max (power-of-two of file size), 46 distance codes + 4 REP symbols, MAX_MATCH 1026.
-- **Entropy coding**: try-all, keep smallest: Huffman (nibble-packed RLE header), rANS (sparse 14-bit freq header, 100KB-2MB), and the **LZMA-style backend** (`src/lzma_coder.rs`, flag 0x20 in header byte 12, params byte at offset 18): adaptive binary range coder, 12-bit probs (shift 5), LZMA 12-state machine, REP0-3, LZMA dist slots (== our DEFLATE dist codes), len coder low/mid/high(10 bits). Literals: lpaq-style integer logistic mixer over {LZMA lit/matched-lit prob, order-1 ctr, hashed order-2 ctr, bias}, weight set = bitpos x matched. lc in {0,1,2,3}, lp=pb=0 (others never won). LZMA backend now wins on every compressible file.
-- **LZMA parse**: after the Huffman DP passes, 2 extra DP passes priced by `Prices::from_lzma_stats` (static estimates from the previous parse for match side; literals priced PER POSITION by `lzma_coder::literal_costs`, a shadow run of the adaptive literal mixer trained on the previous parse literals). Both the Huffman parse and the LZMA parse are tried with the LZMA backend.
+- **Entropy coding**: try-all, keep smallest: Huffman (nibble-packed RLE header), rANS (sparse 14-bit freq header, 100KB-2MB), and the **LZMA-style backend** (`src/lzma_coder.rs`, flag 0x20 in header byte 12, params byte at offset 18): adaptive binary range coder, 12-bit probs (shift 5), LZMA 12-state machine, REP0-3, LZMA dist slots (== our DEFLATE dist codes), len coder low/mid/high(10 bits). Literals: lpaq-style integer logistic mixer over {LZMA lit/matched-lit prob, order-1 ctr, hashed o2/o3/o4/o6/word ctrs (nibble-slotted 16-ctr slots), bias}; weight set = bitpos x matched x ctx-confidence(6); APM (prev byte, node) final p=(mix+3apm)/4. Ctr rate 1/(n+1.5), limit 1020. lc in {0,2}, lp=pb=0. LZMA backend now wins on every compressible file.
+- **LZMA parse**: after 2 Huffman DP passes (seed only), 2 extra DP passes priced by `Prices::from_lzma_stats` (static estimates from the previous parse for match side; literals priced PER POSITION by `lzma_coder::literal_costs`, a shadow run of the adaptive literal mixer trained on the previous parse literals). Both the Huffman parse and the LZMA parse are tried with the LZMA backend.
 - **Reverse**: 16 KB sample pre-check, try both directions. xxhash32 integrity.
 
 ## What Would Break Through
