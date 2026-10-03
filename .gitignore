@@ -2,9 +2,11 @@
 /target/
 **/*.rs.bk
 
-# Test data (large files)
+# Test data (large files, download separately — see README)
 data/enwik8
 data/enwik9
 
-# Autoresearch session files
-autoresearch.jsonl
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -30,14 +30,15 @@ The setup:
   times are recorded alongside it.
 
 ```
-         ┌──────────────────────────────────────────────────┐
-         ▼                                                  │
-  hypothesis ──► edit src/ ──► ./autoresearch.sh ──► ./autoresearch.checks.sh
-                                 (ratio, µs)          (cargo test roundtrips)
-                                                            │
-                     better ──► git commit (keep) ──────────┤
-                     worse  ──► git checkout -- src (discard)┘
-                     every run ──► autoresearch.jsonl
+  ┌─► hypothesis ─► edit src/ ─► ./autoresearch.sh ─► ./autoresearch.checks.sh
+  │                              (ratio, timings)     (cargo test roundtrips)
+  │                                                            │
+  │         ┌──────────────────────────────────────────────────┘
+  │         ▼
+  │    better? ── yes ─► git commit            (keep)
+  │         └──── no ──► git checkout -- src   (discard)
+  │         every run is logged to autoresearch.jsonl
+  └──────── repeat
 ```
 
 ## Results

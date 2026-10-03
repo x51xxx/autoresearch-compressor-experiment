@@ -2,6 +2,11 @@
 name = "lz77-bench"
 version = "0.1.0"
 edition = "2021"
+description = "LZ77 compressor evolved by an AI agent in an autoresearch loop"
+license = "MIT"
+repository = "https://github.com/x51xxx/autoresearch-compressor-experiment"
+readme = "README.md"
+publish = false
 
 [dependencies]
 flate2 = "1"

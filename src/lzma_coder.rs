@@ -337,7 +337,7 @@ impl LitMix {
             o2: vec![CTR_INIT; 1 << o2_bits],
             o3: vec![CTR_INIT; 1 << o2_bits],
             o2_mask: (1 << o2_bits) - 1,
-            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 0]; 16],
+            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 0]; 16 * 9],
             st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0, i3: 0,
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
@@ -362,7 +362,10 @@ impl LitMix {
             self.stretch[(self.o3[self.i3].p >> 4) as usize],
             256,
         ];
-        let w = &self.w[set];
+        let n2 = self.o2[self.i2].n; let n3 = self.o3[self.i3].n;
+        let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
+        self.set = set * 9 + conf;
+        let w = &self.w[self.set];
         let mut dot: i64 = 0;
         for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; }
         self.pr = self.sq((dot >> 16) as i32).clamp(1, 4095);
