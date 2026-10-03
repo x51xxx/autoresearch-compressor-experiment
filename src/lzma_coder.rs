@@ -308,26 +308,34 @@ fn hmix(x: u64, seed: u64) -> u32 {
     ((h ^ (h >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 32) as u32
 }
 
-/// Context hashes for the literal at `pos` (all bytes before `pos` are known to both sides).
-#[inline]
-fn lit_ctx(buf: &[u8], pos: usize) -> [u32; NH] {
-    let mut h8 = 0u64;
-    for k in 1..=8usize.min(pos) { h8 |= (buf[pos - k] as u64) << (8 * (k - 1)); }
-    // word start (at most 32 letters back), then hash forward like literal_costs does
-    let mut k = pos;
-    while k > 0 && pos - k < 32 {
-        let b = buf[k - 1];
-        if !(b.is_ascii_alphabetic() || b >= 0x80) { break; }
-        k -= 1;
+/// Incremental literal context: byte history, current word hash, previous word hash.
+/// `at(buf, pos)` catches up on the bytes before `pos` (all known to both sides).
+struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64 }
+
+impl Ctx {
+    fn new() -> Self { Ctx { pos: 0, hist: 0, word: 0, prevw: 0 } }
+
+    #[inline]
+    fn at(&mut self, buf: &[u8], pos: usize) -> [u32; NH] {
+        while self.pos < pos {
+            let b = buf[self.pos];
+            self.hist = (self.hist << 8) | b as u64;
+            if b.is_ascii_alphabetic() || b >= 0x80 {
+                self.word = (self.word ^ b as u64).wrapping_mul(0x100_0000_01B3);
+            } else {
+                if self.word != 0 { self.prevw = self.word; }
+                self.word = 0;
+            }
+            self.pos += 1;
+        }
+        ctx_from(self.hist, self.word, self.prevw)
     }
-    let mut w = 0u64;
-    for &b in &buf[k..pos] { w = (w ^ b as u64).wrapping_mul(0x100_0000_01B3); }
-    ctx_from(h8, w)
 }
 
 #[inline]
-fn ctx_from(h8: u64, w: u64) -> [u32; NH] {
+fn ctx_from(h8: u64, w: u64, pw: u64) -> [u32; NH] {
     let w = if w == 0 { 0x5555 + (h8 & 0xFF) } else { w };
+    let _ = pw;
     [hmix(h8 & 0xFFFF, 2), hmix(h8 & 0xFF_FFFF, 3), hmix(h8 & 0xFFFF_FFFF, 4),
      hmix(h8 & 0xFFFF_FFFF_FFFF, 6), hmix(w, 7), hmix(h8 & 0xFF_FF00, 8)]
 }
@@ -522,22 +530,16 @@ pub fn literal_costs(input: &[u8], is_lit: &[bool], match_dist: &[u32], lc: u32)
     let table: Vec<u32> = (0..=4096u32).map(|q| if q == 0 { 4096 * 4 } else { (-(q as f64 / 4096.0).log2() * 256.0) as u32 }).collect();
     let mut io = CostIO { cost: 0, table };
     let mut out = vec![0u32; input.len()];
-    let mut hist = 0u64;
-    let mut word = 0u64;
-    let mut wlen = 0usize;
+    let mut cx = Ctx::new();
     for i in 0..input.len() {
-        let prev = (hist & 0xFF) as u8;
+        let prev = if i > 0 { input[i - 1] } else { 0 };
         let base = m.lit_base(i, prev);
         io.cost = 0;
         let md = match_dist[i] as usize;
         let matched = if md > 0 && md <= i { Some(input[i - md] as u32) } else { None };
-        // incremental context; words longer than 32 letters fall back to the exact scan
-        let hs = if wlen < 32 { ctx_from(hist, word) } else { lit_ctx(input, i) };
+        let hs = cx.at(input, i);
         code_lit(&mut io, &mut m, input[i] as u32, base, prev, &hs, matched, is_lit[i]);
         out[i] = io.cost;
-        let b = input[i];
-        hist = (hist << 8) | b as u64;
-        if b.is_ascii_alphabetic() || b >= 0x80 { word = (word ^ b as u64).wrapping_mul(0x100_0000_01B3); wlen += 1; } else { word = 0; wlen = 0; }
     }
     out
 }
@@ -551,6 +553,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
     let mut state = 0usize;
     let mut rep = [0u32; 4];
     let mut pos = 0usize;
+    let mut cx = Ctx::new();
 
     for op in ops {
         let ps = pos & m.pb_mask;
@@ -561,7 +564,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
                 let prev = if pos > 0 { input[pos - 1] } else { 0 };
                 let base = m.lit_base(pos, prev);
                 let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
-                code_lit(&mut e, &mut m, b as u32, base, prev, &lit_ctx(input, pos), matched, true);
+                code_lit(&mut e, &mut m, b as u32, base, prev, &cx.at(input, pos), matched, true);
                 state = st_lit(state);
                 pos += 1;
             }
@@ -624,6 +627,7 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut state = 0usize;
     let mut rep = [0u32; 4];
+    let mut cx = Ctx::new();
 
     while out.len() < orig_len {
         let pos = out.len();
@@ -633,7 +637,7 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
             let prev = if pos > 0 { out[pos - 1] } else { 0 };
             let base = m.lit_base(pos, prev);
             let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
-            let sym = code_lit(&mut d, &mut m, 0, base, prev, &lit_ctx(&out, pos), matched, true);
+            let sym = code_lit(&mut d, &mut m, 0, base, prev, &cx.at(&out, pos), matched, true);
             out.push(sym as u8);
             state = st_lit(state);
             continue;
