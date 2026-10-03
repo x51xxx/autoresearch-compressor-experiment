@@ -296,7 +296,7 @@ const CTR_LIMIT: u16 = 1020;
 const CTR_LIMIT_HI: [u16; NH] = [1020, 1020, 255, 127, 255, 1020, 127];
 /// Hashed literal contexts: order-2, order-3, order-4, order-6, current word.
 const NH: usize = 7;
-const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
+const MIX_N: usize = NH + 4; // LZMA lit prob, order-1, hashed..., match model, bias
 const MIX_LR: i32 = 4;
 const FIN_LR: i32 = 2;
 const NB: usize = 4; // mixer weight banks
@@ -311,17 +311,28 @@ fn hmix(x: u64, seed: u64) -> u32 {
     ((h ^ (h >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 32) as u32
 }
 
-/// Incremental literal context: byte history, current word hash, previous word hash.
+/// Literal context: context hashes plus the match model's expected byte (0x100 | byte, or 0)
+/// and its match length.
+struct Lc { h: [u32; NH], exp: u32, mlen: u32 }
+
+/// Incremental literal context: byte history, current word hash, previous word hash, and a
+/// match model (last position of each order-MM_MIN context; follows the match while it holds).
 /// `at(buf, pos)` catches up on the bytes before `pos` (all known to both sides).
-struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64 }
+struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64, mm: Vec<u32>, mm_shift: u32, mptr: usize, mlen: u32 }
+
+const MM_MIN: usize = 6;
 
 impl Ctx {
-    fn new() -> Self { Ctx { pos: 0, hist: 0, word: 0, prevw: 0 } }
+    fn new(input_len: usize) -> Self {
+        let bits = (input_len.max(1 << 12).next_power_of_two().trailing_zeros() + 1).min(22);
+        Ctx { pos: 0, hist: 0, word: 0, prevw: 0, mm: vec![0; 1 << bits], mm_shift: 64 - bits, mptr: 0, mlen: 0 }
+    }
 
     #[inline]
-    fn at(&mut self, buf: &[u8], pos: usize) -> [u32; NH] {
+    fn at(&mut self, buf: &[u8], pos: usize) -> Lc {
         while self.pos < pos {
             let b = buf[self.pos];
+            if self.mlen > 0 && buf[self.mptr] == b { self.mlen += 1; self.mptr += 1; } else { self.mlen = 0; }
             self.hist = (self.hist << 8) | b as u64;
             if b.is_ascii_alphabetic() || b >= 0x80 {
                 self.word = (self.word ^ b as u64).wrapping_mul(0x100_0000_01B3);
@@ -330,8 +341,14 @@ impl Ctx {
                 self.word = 0;
             }
             self.pos += 1;
+            if self.pos >= MM_MIN {
+                let h = ((self.hist & ((1 << (8 * MM_MIN)) - 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.mm_shift) as usize;
+                if self.mlen == 0 && self.mm[h] > 0 { self.mptr = self.mm[h] as usize; self.mlen = 1; }
+                self.mm[h] = self.pos as u32;
+            }
         }
-        ctx_from(self.hist, self.word, self.prevw)
+        let exp = if self.mlen > 0 { 0x100 | buf[self.mptr] as u32 } else { 0 };
+        Lc { h: ctx_from(self.hist, self.word, self.prevw), exp, mlen: self.mlen }
     }
 }
 
@@ -364,6 +381,8 @@ struct LitMix {
     nbits: u32, // coded literal bits, for the decaying mixer learning rate
     i1: usize,
     hi: [usize; NH],
+    mm_ctr: [Ctr; 32], // P(expected bit is right) by match length
+    mm_on: bool, mm_bit: u32, mm_idx: usize,
     slot: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
     apm_idx: usize, apm_w: i32,
@@ -398,7 +417,7 @@ impl LitMix {
             wb: [vec![w0; 16 * 9], vec![w0; 256 * 2], vec![w0; 256 * 2], vec![w0; 1024]],
             sets: [0; NB], prs: [2048; NB],
             st: [0; MIX_N], pr: 2048, set: 0,
-            wf: vec![{ let mut f = [65536 / NB as i32; NB + 1]; f[NB] = 0; f }; 16], fin: [0; NB + 1], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
+            wf: vec![{ let mut f = [65536 / NB as i32; NB + 1]; f[NB] = 0; f }; 16], fin: [0; NB + 1], fset: 0, nbits: 0, i1: 0, hi: [0; NH], mm_ctr: [CTR_INIT; 32], mm_on: false, mm_bit: 0, mm_idx: 0, slot: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -427,7 +446,8 @@ impl LitMix {
     fn sq(&self, d: i32) -> i32 { self.squash[(d.clamp(-2047, 2047) + 2048) as usize] }
 
     #[inline]
-    fn predict(&mut self, lz_p1: u32, i1: usize, hs: &[u32; NH], node: u32, set: usize) -> u32 {
+    fn predict(&mut self, lz_p1: u32, i1: usize, lc: &Lc, node: u32, set: usize) -> u32 {
+        let hs = &lc.h;
         self.i1 = i1;
         self.st[0] = self.stretch[lz_p1.clamp(1, 4095) as usize];
         self.st[1] = self.stretch[(self.o1[i1].p >> 4) as usize];
@@ -463,6 +483,15 @@ impl LitMix {
             self.hi[k] = self.slot[k] | sub;
             self.st[2 + k] = self.stretch[(self.ht[k][self.hi[k]].p >> 4) as usize];
         }
+        // match model: expected bit while the decoded prefix agrees with the expected byte
+        let nb = 31 - node.leading_zeros();
+        self.mm_on = lc.exp != 0 && lc.exp >> (8 - nb) == node;
+        self.st[MIX_N - 2] = if self.mm_on {
+            self.mm_bit = (lc.exp >> (7 - nb)) & 1;
+            self.mm_idx = lc.mlen.min(31) as usize;
+            let st = self.stretch[(self.mm_ctr[self.mm_idx].p >> 4) as usize];
+            if self.mm_bit != 0 { st } else { -st }
+        } else { 0 };
         self.st[MIX_N - 1] = 256;
         let n2 = self.ht[0][self.hi[0]].n; let n3 = self.ht[1][self.hi[1]].n;
         let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
@@ -528,12 +557,18 @@ impl LitMix {
             if c.n < lim { c.n += 1; }
         };
         upd_ctr(&mut self.o1[self.i1], CTR_LIMIT);
+        if self.mm_on {
+            let c = &mut self.mm_ctr[self.mm_idx];
+            let t = if bit == self.mm_bit { 65535 } else { 0 };
+            c.p = (c.p as i32 + (((t - c.p as i32) * recip[c.n as usize]) >> 16)) as u16;
+            if c.n < 255 { c.n += 1; }
+        }
         for k in 0..NH { upd_ctr(&mut self.ht[k][self.hi[k]], CTR_LIMIT_HI[k]); }
     }
 }
 
 /// Code one literal (encode `byte`, or decode and return it). `matched`: byte at rep0 after a match.
-fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev: u8, hs: &[u32; NH], matched: Option<u32>, update: bool) -> u8 {
+fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev: u8, hs: &Lc, matched: Option<u32>, update: bool) -> u8 {
     let h1 = (prev as usize) << 8;
     let mut node = 1u32;
     let mut offs = 0x100u32;
@@ -575,7 +610,7 @@ pub fn literal_costs(input: &[u8], is_lit: &[bool], match_dist: &[u32], lc: u32)
     let table: Vec<u32> = (0..=4096u32).map(|q| if q == 0 { 4096 * 4 } else { (-(q as f64 / 4096.0).log2() * 256.0) as u32 }).collect();
     let mut io = CostIO { cost: 0, table };
     let mut out = vec![0u32; input.len()];
-    let mut cx = Ctx::new();
+    let mut cx = Ctx::new(input.len());
     for i in 0..input.len() {
         let prev = if i > 0 { input[i - 1] } else { 0 };
         let base = m.lit_base(i, prev);
@@ -598,7 +633,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
     let mut state = 0usize;
     let mut rep = [0u32; 4];
     let mut pos = 0usize;
-    let mut cx = Ctx::new();
+    let mut cx = Ctx::new(input.len());
 
     for op in ops {
         let ps = pos & m.pb_mask;
@@ -672,7 +707,7 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut state = 0usize;
     let mut rep = [0u32; 4];
-    let mut cx = Ctx::new();
+    let mut cx = Ctx::new(orig_len);
 
     while out.len() < orig_len {
         let pos = out.len();
