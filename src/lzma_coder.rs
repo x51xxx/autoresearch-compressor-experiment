@@ -439,7 +439,7 @@ impl LitMix {
     }
 }
 
-const MMIX_N: usize = 7;
+const MMIX_N: usize = 8;
 const MMIX_LR: i32 = 6;
 const MMIX_SHIFT: u32 = 14;
 
@@ -450,6 +450,8 @@ struct MatchMix {
     o1: [Ctr; 256],
     o2: Vec<Ctr>,
     o2_mask: usize,
+    o3: Vec<Ctr>,
+    o3_mask: usize,
     o4: Vec<Ctr>,
     o4_mask: usize,
     run: [Ctr; 8],
@@ -460,6 +462,7 @@ struct MatchMix {
     set: usize,
     i_o1: usize,
     i_o2: usize,
+    i_o3: usize,
     i_o4: usize,
     i_run: usize,
     i_lctx: usize,
@@ -485,14 +488,17 @@ impl MatchMix {
         w0[1] = 16000;
         w0[2] = 8000;
         w0[3] = 8000;
-        w0[4] = 4000;
+        w0[4] = 8000;
         w0[5] = 4000;
-        w0[6] = 0;
+        w0[6] = 4000;
+        w0[7] = 0;
         MatchMix {
             squash, stretch, recip,
             o1: [CTR_INIT; 256],
             o2: vec![CTR_INIT; 4096],
             o2_mask: 4095,
+            o3: vec![CTR_INIT; 4096],
+            o3_mask: 4095,
             o4: vec![CTR_INIT; 8192],
             o4_mask: 8191,
             run: [CTR_INIT; 8],
@@ -503,6 +509,7 @@ impl MatchMix {
             set: 0,
             i_o1: 0,
             i_o2: 0,
+            i_o3: 0,
             i_o4: 0,
             i_run: 0,
             i_lctx: 0,
@@ -525,7 +532,9 @@ impl MatchMix {
         self.i_o1 = prev as usize;
         let h2 = (prev as u64) | ((prev2 as u64) << 8);
         self.i_o2 = (hmix(h2, 0x9E37_79B9) as usize) & self.o2_mask;
-        let h4 = h2 | ((prev3 as u64) << 16) | ((prev4 as u64) << 24);
+        let h3 = h2 | ((prev3 as u64) << 16);
+        self.i_o3 = (hmix(h3, 0xD4E5_A6B7) as usize) & self.o3_mask;
+        let h4 = h3 | ((prev4 as u64) << 24);
         self.i_o4 = (hmix(h4, 0xBF58_476D) as usize) & self.o4_mask;
         self.i_run = lit_run.min(7);
         self.i_lctx = lctx.min(3);
@@ -533,10 +542,11 @@ impl MatchMix {
         self.st[0] = self.stretch[lz_p1.clamp(1, 4095) as usize];
         self.st[1] = self.stretch[(self.o1[self.i_o1].p >> 4) as usize];
         self.st[2] = self.stretch[(self.o2[self.i_o2].p >> 4) as usize];
-        self.st[3] = self.stretch[(self.o4[self.i_o4].p >> 4) as usize];
-        self.st[4] = self.stretch[(self.run[self.i_run].p >> 4) as usize];
-        self.st[5] = self.stretch[(self.lctx[self.i_lctx].p >> 4) as usize];
-        self.st[6] = 256;
+        self.st[3] = self.stretch[(self.o3[self.i_o3].p >> 4) as usize];
+        self.st[4] = self.stretch[(self.o4[self.i_o4].p >> 4) as usize];
+        self.st[5] = self.stretch[(self.run[self.i_run].p >> 4) as usize];
+        self.st[6] = self.stretch[(self.lctx[self.i_lctx].p >> 4) as usize];
+        self.st[7] = 256;
 
         let w = &self.w[self.set];
         let mut dot: i64 = 0;
@@ -569,6 +579,7 @@ impl MatchMix {
         };
         upd_ctr(&mut self.o1[self.i_o1]);
         upd_ctr(&mut self.o2[self.i_o2]);
+        upd_ctr(&mut self.o3[self.i_o3]);
         upd_ctr(&mut self.o4[self.i_o4]);
         upd_ctr(&mut self.run[self.i_run]);
         upd_ctr(&mut self.lctx[self.i_lctx]);
