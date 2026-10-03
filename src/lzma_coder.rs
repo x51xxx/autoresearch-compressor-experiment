@@ -359,6 +359,7 @@ struct LitMix {
     nbits: u32, // coded literal bits, for the decaying mixer learning rate
     i1: usize,
     hi: [usize; NH],
+    slot: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
     apm_idx: usize,
     apm2: Vec<u16>, // [hash(order-2, node)][33 bins]
@@ -390,7 +391,7 @@ impl LitMix {
             w: vec![w0; 16 * 9],
             w2: vec![w0; 256 * 2],
             st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0,
-            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, nbits: 0, i1: 0, hi: [0; NH],
+            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -423,10 +424,29 @@ impl LitMix {
             let hi = (node >> (b - 4)) & 15;
             (hi.wrapping_add(1).wrapping_mul(0x9E37_79B1), ((1 << (b - 4)) | (node & ((1 << (b - 4)) - 1))) as usize)
         };
+        // Slot lookup at nibble starts only: 2-way (slot, slot^16) with a 16-bit check tag
+        // in the unused counter 0 (p = tag, n = use count); a miss replaces the less used slot.
+        let fresh = node == 1 || node >> 4 == 1;
         for k in 0..NH {
-            let h = hs[k] ^ salt;
-            let h = h ^ (h >> 15);
-            self.hi[k] = ((h.wrapping_mul(0x2C1B_3C6D) as usize) & self.h_mask & !0xF) | sub;
+            if fresh {
+                let h = hs[k] ^ salt;
+                let h = h ^ (h >> 15);
+                let hm = h.wrapping_mul(0x2C1B_3C6D);
+                let tag = ((hm >> 16) as u16) | 1;
+                let b0 = (hm as usize) & self.h_mask & !0xF;
+                let b1 = b0 ^ 16;
+                let t = &mut self.ht[k];
+                let b = if t[b0].p == tag { b0 } else if t[b1].p == tag { b1 } else {
+                    let v = if t[b0].n <= t[b1].n { b0 } else { b1 };
+                    for c in &mut t[v..v + 16] { *c = CTR_INIT; }
+                    t[v] = Ctr { p: tag, n: 0 };
+                    if t[v ^ 16].n > 0 { t[v ^ 16].n -= 1; } // age the survivor
+                    v
+                };
+                if t[b].n < 65535 { t[b].n += 1; }
+                self.slot[k] = b;
+            }
+            self.hi[k] = self.slot[k] | sub;
             self.st[2 + k] = self.stretch[(self.ht[k][self.hi[k]].p >> 4) as usize];
         }
         self.st[MIX_N - 1] = 256;
