@@ -295,9 +295,9 @@ const CTR_LIMIT: u16 = 1020;
 /// Hashed literal contexts: order-2, order-3, order-4, order-6, current word.
 const NH: usize = 6;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
-const MIX_LR: i32 = 6;
+const MIX_LR: i32 = 4;
 const FIN_LR: i32 = 2;
-const MIX_LR0: i32 = 3; // extra learning rate at the start, decays over ~256K bits
+const MIX_LR0: i32 = 6; // extra learning rate at the start, decays over ~256K bits
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
 const APM2_BITS: u32 = 16;
