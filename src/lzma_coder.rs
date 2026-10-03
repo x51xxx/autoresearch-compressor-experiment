@@ -449,7 +449,6 @@ struct MatchMix {
     recip: [i32; 1024],
     o1: [Ctr; 256],
     o2: Vec<Ctr>,
-    o2_mask: usize,
     o3: Vec<Ctr>,
     o3_mask: usize,
     o4: Vec<Ctr>,
@@ -503,10 +502,9 @@ impl MatchMix {
         MatchMix {
             squash, stretch, recip,
             o1: [CTR_INIT; 256],
-            o2: vec![CTR_INIT; 4096],
-            o2_mask: 4095,
-            o3: vec![CTR_INIT; 4096],
-            o3_mask: 4095,
+            o2: vec![CTR_INIT; 65536],
+            o3: vec![CTR_INIT; 16384],
+            o3_mask: 16383,
             o4: vec![CTR_INIT; 16384],
             o4_mask: 16383,
             o6: vec![CTR_INIT; 16384],
@@ -544,9 +542,8 @@ impl MatchMix {
     fn predict(&mut self, lz_p1: u32, state: usize, prev: u8, prev2: u8, prev3: u8, prev4: u8, prev5: u8, prev6: u8, prev7: u8, prev8: u8, lit_run: usize, lctx: usize) -> u32 {
         self.set = state.min(11);
         self.i_o1 = prev as usize;
-        let h2 = (prev as u64) | ((prev2 as u64) << 8);
-        self.i_o2 = (hmix(h2, 0x9E37_79B9) as usize) & self.o2_mask;
-        let h3 = h2 | ((prev3 as u64) << 16);
+        self.i_o2 = ((prev as usize) << 8) | (prev2 as usize);
+        let h3 = (prev as u64) | ((prev2 as u64) << 8) | ((prev3 as u64) << 16);
         self.i_o3 = (hmix(h3, 0xD4E5_A6B7) as usize) & self.o3_mask;
         let h4 = h3 | ((prev4 as u64) << 24);
         self.i_o4 = (hmix(h4, 0xBF58_476D) as usize) & self.o4_mask;
