@@ -388,6 +388,8 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
         lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
         let lz_pr = Prices::from_lzma_stats(&lzma_tokens, input);
         lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
+        let lz_pr = Prices::from_lzma_stats(&lzma_tokens, input);
+        lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
     } else {
         let mut prev_byte: u8 = 0;
         for &b in input {
