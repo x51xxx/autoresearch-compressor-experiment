@@ -384,6 +384,8 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
         // Extra DP pass priced for the adaptive LZMA backend (stats from the Huffman parse).
         let lz_pr = Prices::from_lzma_stats(&tokens);
         lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
+        let lz_pr = Prices::from_lzma_stats(&lzma_tokens);
+        lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
     } else {
         let mut prev_byte: u8 = 0;
         for &b in input {
