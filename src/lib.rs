@@ -208,6 +208,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
 
     let mut tokens: Vec<Tok> = Vec::with_capacity(len / 2);
 
+    let mut lzma_tokens: Vec<Tok> = Vec::new();
     if len >= MIN_MATCH {
         // Step 1: Match finding — SA for small files, hash chain for large
         let mut match_ml = vec![0u16; len];
@@ -380,6 +381,9 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
                 }
             }
         }
+        // Extra DP pass priced for the adaptive LZMA backend (stats from the Huffman parse).
+        let lz_pr = Prices::from_lzma_stats(&tokens);
+        lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
     } else {
         let mut prev_byte: u8 = 0;
         for &b in input {
@@ -540,7 +544,9 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
     }
 
     // Try the adaptive LZMA-style backend (no table header), several lc/lp/pb settings.
-    let ops: Vec<lzma_coder::Op> = tokens.iter().map(|t| {
+    for toks in [&tokens, &lzma_tokens] {
+    if toks.is_empty() { continue; }
+    let ops: Vec<lzma_coder::Op> = toks.iter().map(|t| {
         if t.sym < 256 { lzma_coder::Op::Lit(t.sym as u8) } else {
             let li = (t.sym - 257) as usize;
             let ml = LEN_CODE_BASE[li] as u32 + t.len_extra as u32;
@@ -562,6 +568,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
             o.extend_from_slice(&body);
             output = o;
         }
+    }
     }
 
     output
