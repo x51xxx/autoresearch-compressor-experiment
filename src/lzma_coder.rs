@@ -292,7 +292,7 @@ fn squash_i(d: i32) -> i32 {
 #[derive(Clone, Copy)]
 struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
-const CTR_LIMIT: u16 = 30;
+const CTR_LIMIT: u16 = 1020;
 const MIX_N: usize = 4;
 const MIX_LR: i32 = 6;
 const MIX_SHIFT: u32 = 14;
