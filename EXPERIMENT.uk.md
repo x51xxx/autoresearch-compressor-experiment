@@ -495,7 +495,8 @@ ratio. Ця ідея прийшла з code review від Gemini 3.1 Pro — с�
 
 ```bash
 # Клонувати та зібрати
-git clone <repo> && cd experiment
+git clone https://github.com/x51xxx/autoresearch-compressor-experiment
+cd autoresearch-compressor-experiment
 cargo build --release
 
 # Запустити бенчмарк
@@ -508,6 +509,7 @@ cargo build --release
 /autoresearch optimize <ваша ціль>
 ```
 
-Компресор — ~900 рядків Rust без залежностей (lib.rs + huffman.rs + codes.rs + context.rs + checksum.rs + rle.rs +
-range_coder.rs). Вся історія експерименту — в `autoresearch.jsonl` — 140+ записів, що документують кожну гіпотезу,
-результат і рішення.
+На момент написання статті компресор мав ~900 рядків Rust без залежностей (lib.rs + huffman.rs + codes.rs + context.rs +
+checksum.rs + rle.rs + range_coder.rs). Відтоді він виріс до ~3 200 рядків: wave 4 додала LZMA-подібний бекенд
+з range coder і змішаною моделлю літералів та досягла ratio 0.2085, випередивши brotli-11 (див. [README](README.md)).
+Вся історія експерименту — в `autoresearch.jsonl`: по одному запису на кожен запуск, з гіпотезою, результатом і рішенням.

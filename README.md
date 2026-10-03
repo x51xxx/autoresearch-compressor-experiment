@@ -3,7 +3,7 @@
 **Can an AI agent, left alone in an edit → benchmark → keep/revert loop, turn a textbook LZ77 into a competitive compressor?**
 
 This repository is the result: a pure-Rust LZ77 compressor evolved by an AI agent over ~190 autonomous experiments.
-It started at ratio **0.754** (greedy LZ77, 32 KB window) and now reaches **0.209** on the test corpus, beating
+It started at ratio **0.754** (greedy LZ77, 32 KB window) and now reaches **0.2085** on the test corpus, beating
 gzip-9, bzip2, zstd-19, xz and brotli-11.
 
 📖 **Read the full story:** [How We Built a Compressor That Beats gzip-9: An Autoresearch Experiment](https://trishchuk.com/blog/autoresearch-compressor/)
@@ -47,14 +47,14 @@ The setup:
 |---|---:|---|
 | Baseline: greedy LZ77, 32 KB window | 0.754 | |
 | End of the sessions covered in [the article](https://trishchuk.com/blog/autoresearch-compressor/) | 0.221 | −27% vs gzip-9 |
-| **Current best: wave 4** | **0.2088** | beats every reference below |
+| **Current best: wave 4** | **0.2085** | beats every reference below |
 | gzip -9 | 0.303 | |
 | brotli -11 | 0.2167 | |
 | xz / LZMA (raw, lc=3) | 0.2156 | |
 
 **Wave 4** happened after the article was published. Its main addition is an LZMA-style adaptive binary range coder
 with a logistic-mixing literal model, plus DP passes priced by that backend. Those changes took the ratio from 0.2209
-to 0.2088. Compressing the full corpus takes about 5.5 s and decompressing it about 108 ms. The agent's running
+to 0.2085. Compressing the full corpus takes about 6.2 s and decompressing it about 146 ms. The agent's running
 notes and the current architecture are in [autoresearch.md](autoresearch.md).
 
 ### How the ratio got there
@@ -72,7 +72,8 @@ notes and the current architecture are in [autoresearch.md](autoresearch.md).
 | 8 MB window, rANS, suffix array, block DP | 0.221 | Fractional-bit coding; enwik8 went from 40 min to 76 s |
 | LZMA-style range coder | 0.2185 | Adaptive binary coder, 12-state machine |
 | Literal mixing | 0.2137 | lpaq-style logistic mixer over order-0…3 models |
-| LZMA-priced DP | **0.2088** | Per-position literal prices, state-dependent match prices |
+| LZMA-priced DP | 0.2088 | Per-position literal prices, state-dependent match prices |
+| APM/SSE stage | **0.2085** | Secondary estimation after the literal mixer |
 
 Most experiments were discarded. Eight changes produced about 95% of the improvement, and window size mattered more
 than algorithmic cleverness. The article covers what worked, what didn't, and what this says about autoresearch
@@ -108,6 +109,8 @@ are used only by the comparison benchmarks.
 ## Quick start
 
 ```bash
+git clone https://github.com/x51xxx/autoresearch-compressor-experiment
+cd autoresearch-compressor-experiment
 cargo build --release
 
 ./autoresearch.sh          # benchmark the 12-file corpus → METRIC ratio=…
@@ -139,3 +142,17 @@ cargo run --release --bin enwik8_bench
 
 See [the article](https://trishchuk.com/blog/autoresearch-compressor/) for lessons learned: context resets, getting
 ideas from several models, and bugs that tests can't catch, such as infinite loops and running out of memory.
+
+## Test data
+
+| Files | Source | License |
+|---|---|---|
+| `alice29.txt`, `asyoulik.txt`, `cp.html`, `fields.c`, `kennedy.xls`, `plrabn12.txt` | [Canterbury Corpus](https://corpus.canterbury.ac.nz/) | Public research corpus |
+| `urls.10K`, `geo.protodata`, `fireworks.jpeg` | [Snappy test data](https://github.com/google/snappy/tree/main/testdata), via the [LibDeflate](https://github.com/SafeteeWoW/LibDeflate) corpus | BSD-3-Clause (Snappy) |
+| `random_org_10k.bin` | 10 KB of random bytes, via the LibDeflate corpus | — |
+| `franko-*.rtf`, `franko-*.html` | Ivan Franko, *Farbovanyi lys* and *Zakhar Berkut* | Public domain |
+| `enwik8` (downloaded) | [Hutter Prize](http://prize.hutter1.net/) | — |
+
+## License
+
+The code is released under the [MIT](LICENSE) license. Test files keep their original licenses (see above).

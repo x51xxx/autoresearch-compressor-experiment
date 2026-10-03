@@ -488,7 +488,8 @@ the main agent hadn't noticed for 50+ experiments.
 
 ```bash
 # Clone and build
-git clone <repo> && cd experiment
+git clone https://github.com/x51xxx/autoresearch-compressor-experiment
+cd autoresearch-compressor-experiment
 cargo build --release
 
 # Run the benchmark
@@ -501,6 +502,8 @@ cargo build --release
 /autoresearch optimize <your target>
 ```
 
-The compressor is ~900 lines of Rust with no dependencies (lib.rs + huffman.rs + codes.rs + context.rs + checksum.rs + rle.rs +
-range_coder.rs). The full experiment history is in `autoresearch.jsonl` — 140+ entries documenting every hypothesis,
-result, and decision.
+At the time of this write-up the compressor was ~900 lines of Rust with no dependencies (lib.rs + huffman.rs + codes.rs +
+context.rs + checksum.rs + rle.rs + range_coder.rs). It has since grown to ~3,200 lines: wave 4 added an LZMA-style
+range-coder backend with a mixed literal model and reached ratio 0.2085, ahead of brotli-11 (see [README](README.md)).
+The full experiment history is in `autoresearch.jsonl`, with one entry per run documenting every hypothesis, result,
+and decision.

@@ -797,7 +797,7 @@ impl Prices {
                 if pos < input.len() { match_dist[pos] = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra; }
             }
         }
-        pr.lit_pos = Some(lzma_coder::literal_costs(input, &is_lit, &match_dist, 2));
+        pr.lit_pos = Some(lzma_coder::literal_costs(input, &is_lit, &match_dist, 0));
         pr
     }
 }
