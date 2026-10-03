@@ -815,10 +815,10 @@ impl Prices {
         for si in 0..5 {
             let tot_s = (0..256).map(|c| n_lit_lctx[si][c] + n_match_lctx[si][c]).sum::<u32>() as f64 + 1.0;
             let lit_s = (0..256).map(|c| n_lit_lctx[si][c]).sum::<u32>() as f64 + 0.5;
-            let prior_lit = if si == 0 { lit_s / tot_s } else { (lit_s + 2.0 * m_prior_lit) / (tot_s + 2.0) };
+            let prior_lit = if si == 0 { lit_s / tot_s } else { (lit_s + 4.0 * m_prior_lit) / (tot_s + 4.0) };
             for c in 0..256 {
                 let cnt = (n_lit_lctx[si][c] + n_match_lctx[si][c]) as f64;
-                let plit = (n_lit_lctx[si][c] as f64 + 2.0 * prior_lit) / (cnt + 2.0);
+                let plit = (n_lit_lctx[si][c] as f64 + 4.0 * prior_lit) / (cnt + 4.0);
                 pr.st_lit[si][c] = bits(plit, 1.0);
                 pr.st_match[si][c] = bits(1.0 - plit, 1.0);
             }
