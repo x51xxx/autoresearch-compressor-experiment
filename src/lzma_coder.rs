@@ -570,7 +570,7 @@ impl MatchMix {
         for k in 0..MMIX_N { w[k] += (self.st[k] * err) >> MMIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
         let a = &mut self.apm[self.apm_idx];
-        *a = (*a as i32 + ((target - *a as i32) >> 5)) as u16;
+        *a = (*a as i32 + ((target - *a as i32) >> 6)) as u16;
         let recip = &self.recip;
         let upd_ctr = |c: &mut Ctr| {
             let r = recip[c.n as usize];
