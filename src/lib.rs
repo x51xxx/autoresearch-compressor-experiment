@@ -775,12 +775,16 @@ impl Prices {
             }
         }
         let mut is_lit = vec![false; input.len()];
+        let mut match_dist = vec![0u32; input.len()];
         let mut pos = 0usize;
         for t in tokens {
             if t.sym < 256 { is_lit[pos] = true; pos += 1; }
-            else { pos += LEN_CODE_BASE[(t.sym - 257) as usize] as usize + t.len_extra as usize; }
+            else {
+                pos += LEN_CODE_BASE[(t.sym - 257) as usize] as usize + t.len_extra as usize;
+                if pos < input.len() { match_dist[pos] = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra; }
+            }
         }
-        pr.lit_pos = Some((lzma_coder::literal_costs(input, &is_lit, 2), litflag));
+        pr.lit_pos = Some((lzma_coder::literal_costs(input, &is_lit, &match_dist, 2), litflag));
         pr
     }
 }

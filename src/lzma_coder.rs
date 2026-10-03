@@ -410,7 +410,9 @@ impl BitIO for CostIO {
 /// Per-position literal cost under the adaptive literal model (no matched-literal side info).
 /// The model is trained only on positions flagged in `is_lit` (the literals of a previous parse),
 /// but every position is priced, so the DP sees context-specific literal costs.
-pub fn literal_costs(input: &[u8], is_lit: &[bool], lc: u32) -> Vec<u32> {
+/// `match_dist[i]` > 0 marks a literal right after a match in the previous parse (rep0 = that
+/// distance): it is priced with matched-literal side info, as the real coder would.
+pub fn literal_costs(input: &[u8], is_lit: &[bool], match_dist: &[u32], lc: u32) -> Vec<u32> {
     let p = Params { lc, lp: 0, pb: 0 };
     let mut m = Model::new(&p, input.len());
     let table: Vec<u32> = (0..=4096u32).map(|q| if q == 0 { 4096 * 4 } else { (-(q as f64 / 4096.0).log2() * 256.0) as u32 }).collect();
@@ -421,7 +423,9 @@ pub fn literal_costs(input: &[u8], is_lit: &[bool], lc: u32) -> Vec<u32> {
         let prev = (hist & 0xFF) as u8;
         let base = m.lit_base(i, prev);
         io.cost = 0;
-        code_lit(&mut io, &mut m, input[i] as u32, base, hist & 0xFF_FFFF, None, is_lit[i]);
+        let md = match_dist[i] as usize;
+        let matched = if md > 0 && md <= i { Some(input[i - md] as u32) } else { None };
+        code_lit(&mut io, &mut m, input[i] as u32, base, hist & 0xFF_FFFF, matched, is_lit[i]);
         out[i] = io.cost;
         hist = (hist << 8) | input[i] as u32;
     }
