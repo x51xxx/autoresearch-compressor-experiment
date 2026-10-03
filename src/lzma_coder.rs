@@ -231,7 +231,7 @@ impl Model {
         }
         Model {
             lc: p.lc, lp_mask: (1 << p.lp) - 1, pb_mask: pos_states - 1,
-            is_match: vec![PROB_INIT; NUM_STATES << p.pb],
+            is_match: vec![PROB_INIT; (NUM_STATES * 8) << p.pb],
             is_rep: [PROB_INIT; NUM_STATES], is_rep_g0: [PROB_INIT; NUM_STATES],
             is_rep_g1: [PROB_INIT; NUM_STATES], is_rep_g2: [PROB_INIT; NUM_STATES],
             lit: vec![PROB_INIT; 0x300 << (p.lc + p.lp)],
@@ -512,9 +512,10 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
 
     for op in ops {
         let ps = pos & m.pb_mask;
+        let mctx = (((state * 8) + if pos > 0 { (input[pos - 1] >> 5) as usize } else { 0 }) << p.pb) + ps;
         match *op {
             Op::Lit(b) => {
-                e.bit(&mut m.is_match[(state << p.pb) + ps], 0);
+                e.bit(&mut m.is_match[mctx], 0);
                 let prev = if pos > 0 { input[pos - 1] } else { 0 };
                 let base = m.lit_base(pos, prev);
                 let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
@@ -524,7 +525,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
             }
             Op::Match(len, dist) => {
                 let len = len as usize;
-                e.bit(&mut m.is_match[(state << p.pb) + ps], 1);
+                e.bit(&mut m.is_match[mctx], 1);
                 let ri = rep.iter().position(|&r| r == dist && r > 0);
                 if let Some(ri) = ri {
                     e.bit(&mut m.is_rep[state], 1);
@@ -585,7 +586,8 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
     while out.len() < orig_len {
         let pos = out.len();
         let ps = pos & m.pb_mask;
-        if d.bit(&mut m.is_match[(state << p.pb) + ps]) == 0 {
+        let mctx = (((state * 8) + if pos > 0 { (out[pos - 1] >> 5) as usize } else { 0 }) << p.pb) + ps;
+        if d.bit(&mut m.is_match[mctx]) == 0 {
             let prev = if pos > 0 { out[pos - 1] } else { 0 };
             let base = m.lit_base(pos, prev);
             let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
