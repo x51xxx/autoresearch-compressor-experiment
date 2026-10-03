@@ -22,6 +22,9 @@ const LEN_LOW: usize = 1 << LEN_LOW_BITS;
 const LEN_MID: usize = 1 << LEN_MID_BITS;
 const MIN_LEN: usize = 3;
 const NUM_LEN_STATES: usize = 4;
+/// Length-coder context: bucket of the previous match length.
+const LEN_CTX: usize = 4;
+#[inline] fn len_bucket(l: usize) -> usize { if l < 4 { 0 } else if l < 8 { 1 } else if l < 16 { 2 } else { 3 } }
 const NUM_SLOTS: usize = 64;
 const END_POS_MODEL: usize = 14;
 const ALIGN_BITS: usize = 4;
@@ -234,7 +237,7 @@ impl Model {
             lit: vec![PROB_INIT; 0x300 << (p.lc + p.lp)],
             slot: [[PROB_INIT; NUM_SLOTS]; NUM_LEN_STATES],
             spec, align: [PROB_INIT; 1 << ALIGN_BITS],
-            len: LenModel::new(pos_states), rep_len: LenModel::new(pos_states),
+            len: LenModel::new(pos_states * LEN_CTX), rep_len: LenModel::new(pos_states * LEN_CTX),
             mix: LitMix::new(input_len),
         }
     }
@@ -502,6 +505,7 @@ pub fn literal_costs(input: &[u8], is_lit: &[bool], match_dist: &[u32], lc: u32)
 pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
     let mut m = Model::new(p, input.len());
     let mut e = Enc::new();
+    let mut lctx = 0usize;
     let mut state = 0usize;
     let mut rep = [0u32; 4];
     let mut pos = 0usize;
@@ -538,11 +542,13 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
                         for k in (1..=ri).rev() { rep[k] = rep[k - 1]; }
                         rep[0] = d;
                     }
-                    m.rep_len.enc(&mut e, len, ps);
+                    m.rep_len.enc(&mut e, len, ps * LEN_CTX + lctx);
+                    lctx = len_bucket(len);
                     state = st_rep(state);
                 } else {
                     e.bit(&mut m.is_rep[state], 0);
-                    m.len.enc(&mut e, len, ps);
+                    m.len.enc(&mut e, len, ps * LEN_CTX + lctx);
+                    lctx = len_bucket(len);
                     let ls = (len - MIN_LEN).min(NUM_LEN_STATES - 1);
                     let d0 = dist - 1;
                     let slot = dist_slot(d0);
@@ -571,6 +577,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
 pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, String> {
     let mut m = Model::new(p, orig_len);
     let mut d = Dec::new(data);
+    let mut lctx = 0usize;
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut state = 0usize;
     let mut rep = [0u32; 4];
@@ -597,10 +604,12 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
                 for k in (1..=ri).rev() { rep[k] = rep[k - 1]; }
                 rep[0] = dd;
             }
-            len = m.rep_len.dec(&mut d, ps);
+            len = m.rep_len.dec(&mut d, ps * LEN_CTX + lctx);
+            lctx = len_bucket(len);
             state = st_rep(state);
         } else {
-            len = m.len.dec(&mut d, ps);
+            len = m.len.dec(&mut d, ps * LEN_CTX + lctx);
+            lctx = len_bucket(len);
             let ls = (len - MIN_LEN).min(NUM_LEN_STATES - 1);
             let slot = tree_dec(&mut d, &mut m.slot[ls], 6) as usize;
             let d0 = if slot < 4 { slot as u32 } else {
