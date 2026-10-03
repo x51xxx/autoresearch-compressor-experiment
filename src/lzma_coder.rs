@@ -4,7 +4,7 @@
 /// 12-state machine, order-lc literal contexts, matched-literal coding after a match
 /// (byte at rep0 as side information), REP0-REP3 and LZMA distance slots.
 
-const PROB_BITS: u32 = 11;
+const PROB_BITS: u32 = 12;
 const PROB_INIT: u16 = 1 << (PROB_BITS - 1);
 const MOVE_BITS: u32 = 5;
 const TOP: u32 = 1 << 24;
