@@ -11,7 +11,7 @@ Optimize a pure Rust LZ77+Huffman compressor for compression ratio (primary). 12
 `./autoresearch.sh`
 
 ## Current Best
-**Ratio: 0.208793** (wave 4, run 17) - compress 5.52 s, decompress 108 ms for the 12-file corpus.
+**Ratio: 0.208087** (wave 4, run 21) - compress 6.5 s, decompress 167 ms for the 12-file corpus.
 Beats brotli-11 (0.2167), xz/LZMA raw lc=3 (0.2156), zstd-19, gzip-9 (0.303). Wave 4 started at 0.220861.
 
 ## Wave 4 protocol (segment 3 in autoresearch.jsonl)
@@ -35,6 +35,7 @@ To beat brotli-11 (0.217) requires structural changes:
 3. **Binary tree / suffix array match finder** — guaranteed optimal matches
 
 ## Wave 4 dead ends
+- LZMA shortrep (rep0long bit + DP option): worse at all priors
 - MIX_LR 2/4/10/16 all worse than 6
 - Entropy price floor 1/8 bit (no effect); two-rate LZMA counters 4/7,5/6,4/5 (worse); Huffman DP passes 4->3 (worse, no speedup)
 
