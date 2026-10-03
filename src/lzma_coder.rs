@@ -440,7 +440,7 @@ impl LitMix {
 }
 
 const MMIX_N: usize = 8;
-const MMIX_LR: i32 = 5;
+const MMIX_LR: i32 = 4;
 const MMIX_SHIFT: u32 = 14;
 
 struct MatchMix {
