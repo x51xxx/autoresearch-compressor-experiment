@@ -11,11 +11,17 @@ Optimize a pure Rust LZ77+Huffman compressor for compression ratio (primary). 12
 `./autoresearch.sh`
 
 ## Current Best
-**Ratio: 0.199983** (wave 4, run 28) - compress 7.7 s, decompress 363 ms for the 12-file corpus
-(A/B vs wave-4 baseline under equal load: compress 3.78 s -> 7.73 s, decompress 14.5 ms -> 363 ms).
-Beats brotli-11 (0.2167) by 7.7%, xz/LZMA raw lc=3 (0.2156) by 7.2%, gzip-9 (0.303). Wave 4 started at 0.220861 (-9.5%).
-enwik8 (run 28 build): ratio 0.2550 (was 0.285), compress 136 s (was 76 s), decompress 13 s (was ~0.9 s), peak RSS ~4 GB, roundtrip ok.
-Commit/ git: every wave-4 commit is on `main`; commit with explicit paths (`git commit -- src/...`), the user also works in this repo.
+**Ratio: 0.182259** (wave 5 merge, commit 7ee8804) - serial, idle machine: compress 28.9 s, decompress 1.74 s
+for the 12-file corpus (wave-4 best 0.199983 measured the same way: 7.96 s / 0.366 s, so compress x3.6, decompress x4.7).
+Wave 5 ran three parallel lanes in separate worktrees; every jsonl row (segment 4) records `agent`/`model`:
+- **wave5-gemini** (Antigravity, Gemini 3.8 Flash High): 3rd+4th LZMA-priced DP passes (0.1999 -> 0.1915, the DP had not
+  converged), logistic MatchMix on is_match (o2-o8 hashes, lit-run, APM), lctx-conditioned len/rep/flag prices -> 0.186805 alone.
+- **wave5-claude** (Claude Opus 5.5): literal model - 3 APMs (prev byte / o2 / word), 4 weight banks + final mixer, check-tagged
+  2-way hash slots and x64 tables, sparse, word-bigram, indirect-o2 contexts, literal match model, lr decay -> 0.197182 alone.
+- **wave5-codex** (Codex gpt-6.1-sol, high): distance modeling - 8 Bayesian high residual bits, REP0-63 with DP tracking,
+  align ctx by exponent -> 0.198688 alone (mostly kennedy.xls). **Not merged**: its DP rep pricing (`st_rep[s][k<64]`,
+  `dp_reps`) conflicts with Gemini's `st_rep[s][lctx][k]` + `dp_lctx_arr`; needs a manual port onto main.
+Commit/ git: commit with explicit paths (`git commit -- src/...`), the user also works in this repo.
 
 ## Wave 4 protocol (segment 3 in autoresearch.jsonl)
 edit → `./autoresearch.sh` → `./autoresearch.checks.sh` → keep = git commit / discard = `git checkout -- src` → append jsonl line → update this file.

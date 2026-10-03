@@ -1,3 +1,10 @@
+# Ideas Backlog (after wave 5, ratio 0.182259)
+
+## Wave 5 follow-ups (first)
+0. **Port wave5-codex onto main** (est. ~-0.5%): REP0-63 + 8 Bayesian high distance bits + align ctx; merge st_rep as [s][lctx][k<REP_COUNT+1] with Codex's tree pricing per (s, lctx).
+0. **Speed** is now the main debt (compress x3.6, decompress x4.7 vs wave 4): fewer/cheaper DP passes once converged, hash tables x16 instead of x64 with check tags (-0.00002 ratio), SIMD mixer dot products, single literal-model pass for lc.
+0. More LZMA-priced DP passes beyond 4 (Gemini found big gains from 3rd/4th); stop on convergence.
+
 # Ideas Backlog (after wave 4, ratio 0.199983)
 
 ## Next, ranked by expected value / cost
