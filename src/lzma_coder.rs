@@ -5,7 +5,12 @@
 /// (byte at rep0 as side information), REP0-REP3 and LZMA distance slots.
 
 const PROB_BITS: u32 = 12;
-const PROB_INIT: u16 = 1 << (PROB_BITS - 1);
+const PROB_INIT: u16 = (1 << (PROB_BITS - 1)) << 4;
+/// Adaptation shift by observation count (fast start, then LZMA's 1/32).
+const RATE: [u32; 16] = [2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+
+#[inline]
+fn pget(v: u16) -> u32 { (v >> 4) as u32 }
 const MOVE_BITS: u32 = 5;
 const TOP: u32 = 1 << 24;
 
@@ -53,15 +58,9 @@ impl Enc {
 
     #[inline]
     fn bit(&mut self, p: &mut u16, bit: u32) {
-        let bound = (self.range >> PROB_BITS) * (*p as u32);
-        if bit == 0 {
-            self.range = bound;
-            *p += ((1 << PROB_BITS) - *p) >> MOVE_BITS;
-        } else {
-            self.low += bound as u64;
-            self.range -= bound;
-            *p -= *p >> MOVE_BITS;
-        }
+        let bound = (self.range >> PROB_BITS) * pget(*p);
+        if bit == 0 { self.range = bound; } else { self.low += bound as u64; self.range -= bound; }
+        upd(p, bit);
         while self.range < TOP { self.range <<= 8; self.shift_low(); }
     }
 
@@ -105,17 +104,9 @@ impl<'a> Dec<'a> {
 
     #[inline]
     fn bit(&mut self, p: &mut u16) -> u32 {
-        let bound = (self.range >> PROB_BITS) * (*p as u32);
-        let b = if self.code < bound {
-            self.range = bound;
-            *p += ((1 << PROB_BITS) - *p) >> MOVE_BITS;
-            0
-        } else {
-            self.code -= bound;
-            self.range -= bound;
-            *p -= *p >> MOVE_BITS;
-            1
-        };
+        let bound = (self.range >> PROB_BITS) * pget(*p);
+        let b = if self.code < bound { self.range = bound; 0 } else { self.code -= bound; self.range -= bound; 1 };
+        upd(p, b);
         while self.range < TOP { self.range <<= 8; self.code = (self.code << 8) | self.next() as u32; }
         b
     }
@@ -275,7 +266,12 @@ impl<'a> BitIO for Dec<'a> { #[inline] fn code(&mut self, p1: u32, _bit: u32) ->
 
 #[inline]
 fn upd(p: &mut u16, bit: u32) {
-    if bit == 0 { *p += ((1 << PROB_BITS) - *p) >> MOVE_BITS; } else { *p -= *p >> MOVE_BITS; }
+    let n = (*p & 15) as usize;
+    let mut q = pget(*p);
+    let sh = RATE[n].min(MOVE_BITS);
+    if bit == 0 { q += ((1 << PROB_BITS) - q) >> sh; } else { q -= q >> sh; }
+    let q = q.clamp(31, (1 << PROB_BITS) - 31);
+    *p = ((q as u16) << 4) | (n as u16 + (n < 15) as u16);
 }
 
 fn squash_i(d: i32) -> i32 {
@@ -447,7 +443,7 @@ fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev:
     let mset = if matched.is_some() { 8 } else { 0 };
     for k in (0..8).rev() {
         let lz_idx = if matched.is_some() { mb <<= 1; offs + (mb & offs) + node } else { node } as usize;
-        let lz_p1 = (1u32 << PROB_BITS) - m.lit[base + lz_idx] as u32;
+        let lz_p1 = (1u32 << PROB_BITS) - pget(m.lit[base + lz_idx]);
         let p = m.mix.predict(lz_p1, h1 + node as usize, hs, node, mset + 7 - k);
         let bit = io.code(p, (byte >> k) & 1);
         if update {
