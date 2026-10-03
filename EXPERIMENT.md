@@ -1,8 +1,9 @@
 # How We Built a Compressor That Beats gzip-9: An Autoresearch Experiment
 
-*An AI agent ran ~155 autonomous experiments over four sessions, evolving a naive [LZ77](https://en.wikipedia.org/wiki/LZ77_and_LZ78) implementation into a compressor with
-an [rANS](https://en.wikipedia.org/wiki/Asymmetric_numeral_systems) entropy coder, [context modeling](https://en.wikipedia.org/wiki/Context_mixing), and optimal parsing — beating [gzip](https://en.wikipedia.org/wiki/Gzip)-9 by 28%, [zstd](https://en.wikipedia.org/wiki/Zstd)-19 and [bzip2](https://en.wikipedia.org/wiki/Bzip2),
-and coming within 0.9% of [brotli](https://en.wikipedia.org/wiki/Brotli)-11.*
+*An AI agent ran ~200 autonomous experiments over five sessions, evolving a naive [LZ77](https://en.wikipedia.org/wiki/LZ77_and_LZ78) implementation into a compressor with
+optimal parsing, an LZMA-style adaptive range coder and a [context-mixing](https://en.wikipedia.org/wiki/Context_mixing) literal model — beating [gzip](https://en.wikipedia.org/wiki/Gzip)-9 by 34%,
+[brotli](https://en.wikipedia.org/wiki/Brotli)-11 by 7.7%, xz/LZMA by 7.2%, and [zstd](https://en.wikipedia.org/wiki/Zstd)-19 and [bzip2](https://en.wikipedia.org/wiki/Bzip2). The price: decompression is now ~25x slower than
+at the end of session four.*
 
 ## The Idea
 
@@ -348,38 +349,126 @@ A series of optimizations for large files (>1 MB):
 - **1 DP pass** for large files — kennedy degrades by 66%. A minimum of 2 passes is needed.
 - **Greedy pre-pass** for frequency estimation — the greedy algorithm produces completely different frequencies than DP; prices are inaccurate.
 
+## Phase 11: Wave 4 — LZMA-style Backend and Context Mixing (28 experiments)
+
+The fifth session started from ratio **0.2209** and a plain goal: get under brotli-11 (0.2167). The git history from
+earlier sessions was gone, so the wave began with a fresh baseline commit and the protocol written down in
+`autoresearch.md`: a change is kept only if the ratio improves and compression time grows by at most 25% per experiment.
+Decompression speed was recorded but not gated. 18 of 28 experiments were kept.
+
+### First, a Measurement
+
+Before writing code, the agent compressed the corpus with `xz` in raw LZMA mode (`lc=3, pb=0`). It reached **0.2156**,
+better than both our compressor and brotli-11, despite a less thorough parser. LZMA's advantage is its entropy coder:
+an adaptive binary range coder with no table header, a state machine, and "matched literal" coding after a match.
+That decided the plan for the wave: keep our optimal parse and replace the entropy coder.
+
+### LZMA-style Backend (0.2207 → 0.2182)
+
+A small fix came first: the DP had hardcoded 2/3/4-bit prices for REP0-REP2 and counted distance frequencies without
+replaying the rep state, so the encoder's REP codes inflated the regular distance codes. Learned REP prices: 0.2209 → 0.2207.
+
+The new backend (`src/lzma_coder.rs`) is a third option in the existing try-all scheme next to Huffman and rANS, so
+it cannot make any file worse. It uses the LZMA 12-state machine, REP0-REP3, matched literals and LZMA distance slots.
+Our DEFLATE-style distance codes turned out to be exactly LZMA's slots, so the DP could keep its tables. First run:
+**0.2185**; 12-bit probabilities instead of 11: 0.2182.
+
+### Pricing the Parse for the New Coder (0.2182 → 0.2173)
+
+The parse was still optimized for Huffman code lengths. The DP was refactored into `dp_parse()` over per-pass price
+tables (ratio-neutral, and faster). After the Huffman passes, two extra passes use static estimates of the LZMA
+backend's costs taken from the previous parse: is_match per context, bucketed length prices, slot prices, rep-index
+prices.
+
+### Literal Mixing (0.2173 → 0.2137)
+
+Literals were the largest part of the stream on text. Each literal bit is now predicted by an lpaq-style integer
+logistic mixer over the LZMA literal model, an order-1 counter, hashed order-2 and order-3 counters, and a bias. Weight
+sets are selected by bit position and by whether a matched literal is being coded. This was the wave's single largest
+step: **-1.5%**. Integer arithmetic keeps encoder and decoder deterministic. One bug: with probabilities near 1/4096
+the decoder's range needs two normalization shifts, so `if` had to become `while`.
+
+### Per-position Literal Prices (0.2137 → 0.2088)
+
+The DP still priced literals with order-1 statistics while the coder mixed order-1..3 models, so literals looked more
+expensive than they were and the parser chose too many short matches. The fix: a "shadow" run of the adaptive literal
+model over the whole input, trained only at the previous parse's literal positions but pricing every position. The DP
+then sees a literal cost for every byte in its context. **-1.74%** in one experiment (alice29 0.318 → 0.309).
+Two follow-ups: matched-literal side information in the shadow run, and is_match / rep-selection prices split by
+whether the previous token was a match (the coder's `is_match[state]`), worth another -0.55%.
+
+### Model Capacity (0.2088 → 0.2039)
+
+- **APM/SSE** after the mixer in a (previous byte, partial literal) context: -0.13%.
+- **Weight sets selected by context confidence** (whether the order-2/order-3 contexts have been seen, and how often): -0.18%.
+- **Order-4**, then **order-6 and word** contexts: -0.34%, then -1.57% together with two speed fixes.
+- **Count-adaptive binary probabilities** (fast adaptation for the first observations, a 4-bit count packed into the u16): -0.11%.
+
+The hash tables needed care. A 256-counter block per context wasted most of the table and lost ratio; hashing every
+bit separately gave the best ratio but cost +69% time from cache misses. The compromise from paq/lpaq — one 16-counter
+slot per nibble, i.e. one cache line — kept almost all of the ratio at a fraction of the cost.
+
+### Contexts for the Match Side (0.2039 → 0.2000)
+
+A breakdown of the coded stream showed where the bits went: distances took 35% (alice29) to 59% (franko-berkut), and
+on kennedy.xls 49% went to match lengths. The LZMA length coder had almost no context (pb=0 always won).
+Using the bucket of the previous match length as context cut kennedy.xls by **15%**. Previous-byte bits as is_match
+context and previous-length context for the rep flags brought the corpus to **0.199983**.
+
+### What Did NOT Work
+
+- **Two-rate probability counters** (average of fast and slow): worse at every rate pair tried.
+- **LZMA short rep** (one byte from rep0): worse with every prior. Matched-literal mixing already codes that byte cheaply, and the extra flag costs bits on every rep0 match.
+- **Distance-slot context** by previous byte or by state: worse, the statistics get diluted.
+- **Lower price floor** (1/8 bit instead of 1 bit): no effect, because the last Huffman pass used integer code lengths anyway.
+
+### The Cost
+
+Wave 4 traded speed for ratio. Measured against the wave's starting point under the same machine load, compressing
+the corpus went from 3.78 s to 7.73 s (x2) and decompressing from 14.5 ms to 363 ms (x25, ~240 MB/s → ~10 MB/s).
+Decompression now runs at context-mixing speed rather than LZ77 speed: every literal bit passes through eight model
+inputs, a mixer and an APM. On enwik8, compression went from 76 s to 136 s, decompression from ~0.9 s to 13 s, and
+peak memory is about 4 GB.
+
 ## Final Comparison
 
+After wave 4 (session 4 result in the first column for reference):
+
 ```
-File                  Ours    gzip-9   brotli-11  Change vs gzip
-alice29.txt          0.329    0.360    0.310       -8.6%
-asyoulik.txt         0.358    0.390    0.341       -8.2%
-fields.c             0.255    0.260    0.227       -2.1%
-cp.html              0.307    0.324    0.280       -5.3%
-kennedy.xls          0.047    0.201    0.060      -76.6%  ← beats brotli-11!
-plrabn12.txt         0.359    0.410    0.345      -12.4%
-urls.10K             0.218    0.312    0.210      -30.1%
-geo.protodata        0.107    0.127    0.099      -15.5%
-franko-lys.rtf       0.075    0.082    0.072       -8.9%
-franko-berkut.html   0.235    0.275    0.221      -14.7%
-AVERAGE              0.221    0.303    0.217      -27.1%
+File                 Session 4  Wave 4   gzip-9  brotli-11   xz    Change vs gzip
+alice29.txt            0.329    0.290    0.360    0.310    0.322     -19.3%
+asyoulik.txt           0.358    0.315    0.390    0.341    0.355     -19.2%
+fields.c               0.255    0.235    0.260    0.227    0.243      -9.8%
+cp.html                0.307    0.294    0.324    0.280    0.308      -9.2%
+kennedy.xls            0.047    0.038    0.201    0.060    0.047     -81.1%
+plrabn12.txt           0.359    0.315    0.410    0.345    0.349     -23.1%
+urls.10K               0.218    0.201    0.312    0.209    0.213     -35.4%
+geo.protodata          0.107    0.098    0.126    0.099    0.099     -22.4%
+franko-lys.rtf         0.075    0.069    0.082    0.072    0.070     -16.0%
+franko-berkut.html     0.235    0.207    0.275    0.221    0.221     -24.7%
+TOTAL (12 files)       0.221    0.200    0.303    0.217    0.216     -33.9%
 ```
 
-We beat gzip-9 on **all 10** compressible files, **-27%** overall. kennedy.xls **0.047** — **21% better than brotli-11**!
+(brotli-11 with `-w 24`, xz in raw LZMA mode with `lc=3, pb=0`. The total includes the JPEG and the random file.)
 
-**On enwik8 (100 MB):** ratio **0.285** (with optimized parameters), compression **76 seconds**. Beating gzip-9 by **22%**, brotli-6 by **8%**.
+We beat gzip-9 on **all 10** compressible files, **-34%** overall, and beat brotli-11 on 8 of 10. brotli-11 still wins
+on the two smallest files, fields.c and cp.html, where its built-in 120 KB dictionary matters most.
+
+**On enwik8 (100 MB):** ratio **0.255** (session 4: 0.285), ahead of zstd-19 (0.269); compression takes 136 seconds.
 
 ### Speed (In-process, Fair Benchmark)
 
 ```
 12-file corpus (3.47 MB):
-  OURS:     248 MB/s decompress, ratio 0.221
+  OURS (wave 4):    0.45 MB/s compress, 9.5 MB/s decompress, ratio 0.200
+  OURS (session 4): 248 MB/s decompress, ratio 0.221
   gzip-9:   486 MB/s decompress, ratio 0.304
   brotli-6: 532 MB/s decompress, ratio 0.242
   zstd-1:  1270 MB/s decompress, ratio 0.292
 
 enwik8 (100 MB):
-  OURS:     1.3 MB/s compress, 111 MB/s decompress, ratio 0.285
+  OURS (wave 4):    0.73 MB/s compress, 7.7 MB/s decompress, ratio 0.255
+  OURS (session 4): 1.3 MB/s compress, 111 MB/s decompress, ratio 0.285
   gzip-9:  36 MB/s compress, 306 MB/s decompress, ratio 0.365
   brotli-6: 35 MB/s compress, 365 MB/s decompress, ratio 0.310
   zstd-19:  2.1 MB/s compress, 794 MB/s decompress, ratio 0.269
@@ -404,9 +493,18 @@ enwik8 (100 MB):
 | + 8 MB window | 0.225 | 46 distance codes, enwik8 -7.4% |
 | + rANS (try-both) | 0.219 | Fractional bits for large files, kennedy -28% |
 | + suffix array | 0.220 | Guaranteed optimal matches, 7x faster |
-| + block DP + speed | **0.221** | 256 KB blocks, enwik8 40 min → 76s |
+| + block DP + speed | 0.221 | 256 KB blocks, enwik8 40 min → 76s |
+| + learned REP prices | 0.2207 | Wave 4: DP learns REP0-REP2 costs |
+| + LZMA-style backend | 0.2182 | Adaptive binary range coder, try-all with Huffman/rANS |
+| + LZMA-priced DP | 0.2173 | Extra DP passes priced for the new coder |
+| + literal mixing | 0.2137 | Logistic mixer over LZMA, order-1..3 literal models |
+| + per-position literal prices | 0.2088 | Shadow run of the literal model prices every byte for the DP |
+| + APM, confidence, order-4 | 0.2074 | Secondary estimation, weight sets by context confidence |
+| + order-6 + word contexts | 0.2041 | Nibble-slotted hash tables |
+| + count-adaptive probabilities | 0.2039 | Fast start for every binary probability |
+| + match-side contexts | **0.2000** | Previous-length context for lengths and rep flags, prev byte for is_match |
 
-**Overall: more than 3.4x better compression from a clean slate to a compressor that surpasses gzip-9 by 27%, beats bzip2 and brotli-6, and comes within 1.8% of brotli-11 — built through ~175 autonomous experiments with 32x speed optimization.**
+**Overall: 3.8x better compression from a clean slate to a compressor that surpasses gzip-9 by 34%, brotli-11 by 7.7% and xz by 7.2% — built through ~200 autonomous experiments. The first four sessions also made it 32x faster; the fifth gave much of that speed back for ratio.**
 
 ## What We Learned About Autoresearch
 
@@ -502,8 +600,8 @@ cargo build --release
 /autoresearch optimize <your target>
 ```
 
-At the time of this write-up the compressor was ~900 lines of Rust with no dependencies (lib.rs + huffman.rs + codes.rs +
-context.rs + checksum.rs + rle.rs + range_coder.rs). It has since grown to ~3,200 lines: wave 4 added an LZMA-style
-range-coder backend with a mixed literal model and reached ratio 0.2085, ahead of brotli-11 (see [README](README.md)).
+After session four the compressor was ~900 lines of Rust with no dependencies (lib.rs + huffman.rs + codes.rs +
+context.rs + checksum.rs + rle.rs + range_coder.rs). After wave 4 the library is ~3,300 lines: the LZMA-style
+backend with its mixed literal model lives in `lzma_coder.rs`, and the ratio is 0.2000 (see Phase 11).
 The full experiment history is in `autoresearch.jsonl`, with one entry per run documenting every hypothesis, result,
 and decision.

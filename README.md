@@ -2,9 +2,9 @@
 
 **Can an AI agent, left alone in an edit → benchmark → keep/revert loop, turn a textbook LZ77 into a competitive compressor?**
 
-This repository is the result: a pure-Rust LZ77 compressor evolved by an AI agent over ~190 autonomous experiments.
-It started at ratio **0.754** (greedy LZ77, 32 KB window) and now reaches **0.2085** on the test corpus, beating
-gzip-9, bzip2, zstd-19, xz and brotli-11.
+This repository is the result: a pure-Rust LZ77 compressor evolved by an AI agent over ~200 autonomous experiments.
+It started at ratio **0.754** (greedy LZ77, 32 KB window) and now reaches **0.2000** on the test corpus, beating
+gzip-9 (by 34%), bzip2, zstd-19, xz (by 7.2%) and brotli-11 (by 7.7%).
 
 📖 **Read the full story:** [How We Built a Compressor That Beats gzip-9: An Autoresearch Experiment](https://trishchuk.com/blog/autoresearch-compressor/)
 · in this repo: [EXPERIMENT.md](EXPERIMENT.md) (English) · [EXPERIMENT.uk.md](EXPERIMENT.uk.md) (Українською)
@@ -47,15 +47,22 @@ The setup:
 |---|---:|---|
 | Baseline: greedy LZ77, 32 KB window | 0.754 | |
 | End of the sessions covered in [the article](https://trishchuk.com/blog/autoresearch-compressor/) | 0.221 | −27% vs gzip-9 |
-| **Current best: wave 4** | **0.2085** | beats every reference below |
+| **Current best: wave 4** | **0.2000** | beats every reference below |
 | gzip -9 | 0.303 | |
 | brotli -11 | 0.2167 | |
 | xz / LZMA (raw, lc=3) | 0.2156 | |
 
 **Wave 4** happened after the article was published. Its main addition is an LZMA-style adaptive binary range coder
 with a logistic-mixing literal model, plus DP passes priced by that backend. Those changes took the ratio from 0.2209
-to 0.2085. Compressing the full corpus takes about 6.2 s and decompressing it about 146 ms. The agent's running
-notes and the current architecture are in [autoresearch.md](autoresearch.md).
+to 0.2000 (28 experiments, 18 kept). The gain cost speed: compared with the start of the wave, compressing the corpus
+went from 3.8 s to 7.7 s, and decompressing it from 14.5 ms to 363 ms (about 240 MB/s → 10 MB/s). brotli-11 still
+wins on the two smallest files (fields.c, cp.html) thanks to its built-in dictionary.
+
+On enwik8 (100 MB) the ratio is **0.255** (it was 0.285 before wave 4; zstd-19 gets 0.269). Compression takes 136 s,
+decompression 13 s, and peak memory is about 4 GB.
+
+The agent's running notes and the current architecture are in [autoresearch.md](autoresearch.md); the remaining
+ideas are in [autoresearch.ideas.md](autoresearch.ideas.md).
 
 ### How the ratio got there
 
@@ -70,13 +77,15 @@ notes and the current architecture are in [autoresearch.md](autoresearch.md).
 | Larger window | 0.253 | Dynamic window up to 256 KB |
 | REP tracking in DP | 0.231 | DP tracks recent distances |
 | 8 MB window, rANS, suffix array, block DP | 0.221 | Fractional-bit coding; enwik8 went from 40 min to 76 s |
-| LZMA-style range coder | 0.2185 | Adaptive binary coder, 12-state machine |
-| Literal mixing | 0.2137 | lpaq-style logistic mixer over order-0…3 models |
+| LZMA-style range coder | 0.2182 | Adaptive binary coder, 12-state machine |
+| Literal mixing | 0.2137 | lpaq-style logistic mixer over order-1…3 models |
 | LZMA-priced DP | 0.2088 | Per-position literal prices, state-dependent match prices |
-| APM/SSE stage | **0.2085** | Secondary estimation after the literal mixer |
+| More literal contexts | 0.2041 | APM/SSE, order-4/6 and word contexts, nibble-slotted hashing |
+| Match-side contexts | **0.2000** | Previous match length as context for lengths and rep flags |
 
-Most experiments were discarded. Eight changes produced about 95% of the improvement, and window size mattered more
-than algorithmic cleverness. The article covers what worked, what didn't, and what this says about autoresearch
+Most experiments were discarded. In the first four sessions eight changes produced about 95% of the improvement, and
+window size mattered more than algorithmic cleverness. In wave 4 the big steps were the new entropy coder, literal
+mixing, and making the parser price literals the way the coder actually codes them. The article covers what worked, what didn't, and what this says about autoresearch
 itself.
 
 ## What's inside
