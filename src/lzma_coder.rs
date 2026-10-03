@@ -439,7 +439,7 @@ impl LitMix {
     }
 }
 
-const MMIX_N: usize = 8;
+const MMIX_N: usize = 9;
 const MMIX_LR: i32 = 4;
 const MMIX_SHIFT: u32 = 14;
 
@@ -454,6 +454,8 @@ struct MatchMix {
     o3_mask: usize,
     o4: Vec<Ctr>,
     o4_mask: usize,
+    o6: Vec<Ctr>,
+    o6_mask: usize,
     run: [Ctr; 8],
     lctx: [Ctr; 4],
     w: [[i32; MMIX_N]; 12],
@@ -464,6 +466,7 @@ struct MatchMix {
     i_o2: usize,
     i_o3: usize,
     i_o4: usize,
+    i_o6: usize,
     i_run: usize,
     i_lctx: usize,
     apm: Vec<u16>,
@@ -489,9 +492,10 @@ impl MatchMix {
         w0[2] = 8000;
         w0[3] = 8000;
         w0[4] = 8000;
-        w0[5] = 4000;
+        w0[5] = 8000;
         w0[6] = 4000;
-        w0[7] = 0;
+        w0[7] = 4000;
+        w0[8] = 0;
         MatchMix {
             squash, stretch, recip,
             o1: [CTR_INIT; 256],
@@ -501,6 +505,8 @@ impl MatchMix {
             o3_mask: 4095,
             o4: vec![CTR_INIT; 8192],
             o4_mask: 8191,
+            o6: vec![CTR_INIT; 8192],
+            o6_mask: 8191,
             run: [CTR_INIT; 8],
             lctx: [CTR_INIT; 4],
             w: [w0; 12],
@@ -511,6 +517,7 @@ impl MatchMix {
             i_o2: 0,
             i_o3: 0,
             i_o4: 0,
+            i_o6: 0,
             i_run: 0,
             i_lctx: 0,
             apm: {
@@ -527,7 +534,7 @@ impl MatchMix {
     fn sq(&self, d: i32) -> i32 { self.squash[(d.clamp(-2047, 2047) + 2048) as usize] }
 
     #[inline]
-    fn predict(&mut self, lz_p1: u32, state: usize, prev: u8, prev2: u8, prev3: u8, prev4: u8, lit_run: usize, lctx: usize) -> u32 {
+    fn predict(&mut self, lz_p1: u32, state: usize, prev: u8, prev2: u8, prev3: u8, prev4: u8, prev5: u8, prev6: u8, lit_run: usize, lctx: usize) -> u32 {
         self.set = state.min(11);
         self.i_o1 = prev as usize;
         let h2 = (prev as u64) | ((prev2 as u64) << 8);
@@ -536,6 +543,8 @@ impl MatchMix {
         self.i_o3 = (hmix(h3, 0xD4E5_A6B7) as usize) & self.o3_mask;
         let h4 = h3 | ((prev4 as u64) << 24);
         self.i_o4 = (hmix(h4, 0xBF58_476D) as usize) & self.o4_mask;
+        let h6 = h4 | ((prev5 as u64) << 32) | ((prev6 as u64) << 40);
+        self.i_o6 = (hmix(h6, 0x517C_C1B7) as usize) & self.o6_mask;
         self.i_run = lit_run.min(7);
         self.i_lctx = lctx.min(3);
 
@@ -544,9 +553,10 @@ impl MatchMix {
         self.st[2] = self.stretch[(self.o2[self.i_o2].p >> 4) as usize];
         self.st[3] = self.stretch[(self.o3[self.i_o3].p >> 4) as usize];
         self.st[4] = self.stretch[(self.o4[self.i_o4].p >> 4) as usize];
-        self.st[5] = self.stretch[(self.run[self.i_run].p >> 4) as usize];
-        self.st[6] = self.stretch[(self.lctx[self.i_lctx].p >> 4) as usize];
-        self.st[7] = 256;
+        self.st[5] = self.stretch[(self.o6[self.i_o6].p >> 4) as usize];
+        self.st[6] = self.stretch[(self.run[self.i_run].p >> 4) as usize];
+        self.st[7] = self.stretch[(self.lctx[self.i_lctx].p >> 4) as usize];
+        self.st[8] = 256;
 
         let w = &self.w[self.set];
         let mut dot: i64 = 0;
@@ -581,6 +591,7 @@ impl MatchMix {
         upd_ctr(&mut self.o2[self.i_o2]);
         upd_ctr(&mut self.o3[self.i_o3]);
         upd_ctr(&mut self.o4[self.i_o4]);
+        upd_ctr(&mut self.o6[self.i_o6]);
         upd_ctr(&mut self.run[self.i_run]);
         upd_ctr(&mut self.lctx[self.i_lctx]);
     }
@@ -667,8 +678,10 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
         let prev2 = if pos > 1 { input[pos - 2] } else { 0 };
         let prev3 = if pos > 2 { input[pos - 3] } else { 0 };
         let prev4 = if pos > 3 { input[pos - 4] } else { 0 };
+        let prev5 = if pos > 4 { input[pos - 5] } else { 0 };
+        let prev6 = if pos > 5 { input[pos - 6] } else { 0 };
         let lz_p1 = (1u32 << PROB_BITS) - pget(m.is_match[mctx]);
-        let p_match = m.mmix.predict(lz_p1, state, prev, prev2, prev3, prev4, lit_run, lctx);
+        let p_match = m.mmix.predict(lz_p1, state, prev, prev2, prev3, prev4, prev5, prev6, lit_run, lctx);
         match *op {
             Op::Lit(b) => {
                 e.bit_p(p_match, 0);
@@ -753,8 +766,10 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
         let prev2 = if pos > 1 { out[pos - 2] } else { 0 };
         let prev3 = if pos > 2 { out[pos - 3] } else { 0 };
         let prev4 = if pos > 3 { out[pos - 4] } else { 0 };
+        let prev5 = if pos > 4 { out[pos - 5] } else { 0 };
+        let prev6 = if pos > 5 { out[pos - 6] } else { 0 };
         let lz_p1 = (1u32 << PROB_BITS) - pget(m.is_match[mctx]);
-        let p_match = m.mmix.predict(lz_p1, state, prev, prev2, prev3, prev4, lit_run, lctx);
+        let p_match = m.mmix.predict(lz_p1, state, prev, prev2, prev3, prev4, prev5, prev6, lit_run, lctx);
         let is_m = d.bit_p(p_match);
         upd(&mut m.is_match[mctx], is_m);
         m.mmix.update(is_m);
