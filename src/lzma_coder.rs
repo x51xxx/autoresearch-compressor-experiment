@@ -366,7 +366,7 @@ struct LitMix {
     hi: [usize; NH],
     slot: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
-    apm_idx: usize,
+    apm_idx: usize, apm_w: i32,
     apm2: Vec<u16>, // [hash(order-2, node)][33 bins]
     apm2_idx: usize,
 }
@@ -403,7 +403,7 @@ impl LitMix {
                 for _ in 0..65536 { v.extend_from_slice(&row); }
                 v
             },
-            apm_idx: 0,
+            apm_idx: 0, apm_w: 0,
             apm2: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity((1 << APM2_BITS) * 33);
@@ -478,11 +478,11 @@ impl LitMix {
         let lo = (sv >> 7) as usize;
         let w = sv & 127;
         let base = i1 * 33 + lo;
-        self.apm_idx = base + (w >> 6) as usize;
+        self.apm_idx = base; self.apm_w = w;
         let pa = ((self.apm[base] as i32 * (128 - w) + self.apm[base + 1] as i32 * w) >> 11).clamp(1, 4095);
         let r2 = ((hs[0] ^ node.wrapping_mul(0x9E37_79B1)).wrapping_mul(0x2C1B_3C6D) >> (32 - APM2_BITS)) as usize;
         let base2 = r2 * 33 + lo;
-        self.apm2_idx = base2 + (w >> 6) as usize;
+        self.apm2_idx = base2;
         let pa2 = ((self.apm2[base2] as i32 * (128 - w) + self.apm2[base2 + 1] as i32 * w) >> 11).clamp(1, 4095);
         ((self.pr + 5 * pa + 2 * pa2) >> 3).clamp(1, 4095) as u32
     }
@@ -500,10 +500,14 @@ impl LitMix {
         let wf = &mut self.wf[self.fset];
         for k in 0..=NB { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
-        let a = &mut self.apm[self.apm_idx];
-        *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
-        let a = &mut self.apm2[self.apm2_idx];
-        *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
+        // update both interpolation bins, each in proportion to its weight
+        let (wl, wh) = (128 - self.apm_w, self.apm_w);
+        for (t, i) in [(&mut self.apm, self.apm_idx), (&mut self.apm2, self.apm2_idx)] {
+            let a = &mut t[i];
+            *a = (*a as i32 + (((target - *a as i32) * wl) >> (APM_RATE + 6))) as u16;
+            let a = &mut t[i + 1];
+            *a = (*a as i32 + (((target - *a as i32) * wh) >> (APM_RATE + 6))) as u16;
+        }
         let recip = &self.recip;
         let upd_ctr = |c: &mut Ctr, lim: u16| {
             let r = recip[c.n as usize];
