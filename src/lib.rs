@@ -546,8 +546,9 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
     }
 
     // Try the adaptive LZMA-style backend (no table header), several lc/lp/pb settings.
-    for toks in [&tokens, &lzma_tokens] {
-    if toks.is_empty() { continue; }
+    // The LZMA-priced parse always beats the Huffman parse under the LZMA backend; fall back
+    // to the Huffman parse only when no LZMA parse exists (tiny inputs).
+    for toks in [if lzma_tokens.is_empty() { &tokens } else { &lzma_tokens }] {
     let ops: Vec<lzma_coder::Op> = toks.iter().map(|t| {
         if t.sym < 256 { lzma_coder::Op::Lit(t.sym as u8) } else {
             let li = (t.sym - 257) as usize;
@@ -576,7 +577,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
     output
 }
 
-const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)];
+const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(0, 0, 0), (2, 0, 0), (3, 0, 0)];
 
 fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
                dist_freq: &[u32; NUM_DIST], num_ctx_used: usize, use_ctx: bool,
