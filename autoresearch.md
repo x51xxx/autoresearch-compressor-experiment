@@ -14,6 +14,7 @@ Optimize a pure Rust LZ77+Huffman compressor for compression ratio (primary). 12
 **Ratio: 0.199983** (wave 4, run 28) - compress 7.7 s, decompress 363 ms for the 12-file corpus
 (A/B vs wave-4 baseline under equal load: compress 3.78 s -> 7.73 s, decompress 14.5 ms -> 363 ms).
 Beats brotli-11 (0.2167) by 7.7%, xz/LZMA raw lc=3 (0.2156) by 7.2%, gzip-9 (0.303). Wave 4 started at 0.220861 (-9.5%).
+enwik8 (run 28 build): ratio 0.2550 (was 0.285), compress 136 s (was 76 s), decompress 13 s (was ~0.9 s), peak RSS ~4 GB, roundtrip ok.
 Commit/ git: every wave-4 commit is on `main`; commit with explicit paths (`git commit -- src/...`), the user also works in this repo.
 
 ## Wave 4 protocol (segment 3 in autoresearch.jsonl)
