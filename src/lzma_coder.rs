@@ -338,9 +338,11 @@ struct LitMix {
     ht: Vec<Vec<Ctr>>,
     h_mask: usize,
     w: Vec<[i32; MIX_N]>,
+    w2: Vec<[i32; MIX_N]>, // second weight bank selected by prev byte
     st: [i32; MIX_N],
     pr: i32,
-    set: usize,
+    pr1: i32, pr2: i32,
+    set: usize, set2: usize,
     i1: usize,
     hi: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
@@ -372,7 +374,8 @@ impl LitMix {
             ht: (0..NH).map(|_| vec![CTR_INIT; 1 << h_bits]).collect(),
             h_mask: (1 << h_bits) - 1,
             w: vec![w0; 16 * 9],
-            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, hi: [0; NH],
+            w2: vec![w0; 256 * 2],
+            st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0, i1: 0, hi: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -415,10 +418,14 @@ impl LitMix {
         let n2 = self.ht[0][self.hi[0]].n; let n3 = self.ht[1][self.hi[1]].n;
         let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
         self.set = set * 9 + conf;
-        let w = &self.w[self.set];
-        let mut dot: i64 = 0;
-        for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; }
-        self.pr = self.sq((dot >> 16) as i32).clamp(1, 4095);
+        self.set2 = ((i1 >> 8) << 1) | (set >= 8) as usize;
+        let (w, w2) = (&self.w[self.set], &self.w2[self.set2]);
+        let (mut dot, mut dot2) = (0i64, 0i64);
+        for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; dot2 += self.st[k] as i64 * w2[k] as i64; }
+        let (d1, d2) = ((dot >> 16) as i32, (dot2 >> 16) as i32);
+        self.pr1 = self.sq(d1).clamp(1, 4095);
+        self.pr2 = self.sq(d2).clamp(1, 4095);
+        self.pr = self.sq((d1 + d2) >> 1).clamp(1, 4095);
         // APM / SSE refinement in context (prev byte, partial literal)
         let sv = self.stretch[self.pr as usize] + 2048;
         let lo = (sv >> 7) as usize;
@@ -435,8 +442,11 @@ impl LitMix {
 
     #[inline]
     fn update(&mut self, bit: u32) {
-        let err = (((bit as i32) << 12) - self.pr) * MIX_LR;
+        let err = (((bit as i32) << 12) - self.pr1) * MIX_LR;
         let w = &mut self.w[self.set];
+        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        let err = (((bit as i32) << 12) - self.pr2) * MIX_LR;
+        let w = &mut self.w2[self.set2];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
         let a = &mut self.apm[self.apm_idx];
