@@ -378,7 +378,7 @@ impl LitMix {
         for j in pi..4096 { stretch[j] = 2047; }
         let mut recip = [0i32; 1024];
         for n in 0..1024 { recip[n] = (65536.0 / (n as f64 + 1.5)) as i32; }
-        let h_bits = ((input_len * 8).max(1 << 16).next_power_of_two().trailing_zeros()).min(22);
+        let h_bits = ((input_len * 64).max(1 << 16).next_power_of_two().trailing_zeros()).min(24);
         let mut w0 = [65536 / 4; MIX_N];
         w0[0] = 65536 / 2;
         w0[MIX_N - 1] = 0;
