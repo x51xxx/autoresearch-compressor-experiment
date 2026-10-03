@@ -356,7 +356,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
 
                     // Rep-distance match
                     let rep_dists = [rep_d, rep_d1, rep_d2];
-                    let rep_prices_arr = [2u64 * 256, 3u64 * 256, 4u64 * 256];
+                    let rep_prices_arr = [dist_prices[REP0_SYM] as u64, dist_prices[REP1_SYM] as u64, dist_prices[REP2_SYM] as u64];
                     for rep_slot in 0..3 {
                         let rd = rep_dists[rep_slot];
                         if rd == 0 || rd > i || i + MIN_MATCH > len { continue; }
@@ -472,10 +472,20 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
             if iteration < num_dp_passes - 1 {
                 let mut llf = [[0u32; NUM_LITLEN]; NUM_CTX];
                 let mut df = [0u32; NUM_DIST];
+                let mut rep = [0u32; 4];
                 for t in &tokens {
                     let ctx = context_class(t.prev_byte);
                     llf[ctx][t.sym as usize] += 1;
-                    if t.sym >= 257 { df[t.dist_code as usize] += 1; }
+                    if t.sym >= 257 {
+                        let md = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra;
+                        if md == rep[0] && rep[0] > 0 { df[REP0_SYM] += 1; continue; }
+                        let sym = if md == rep[1] && rep[1] > 0 { REP1_SYM }
+                            else if md == rep[2] && rep[2] > 0 { REP2_SYM }
+                            else if md == rep[3] && rep[3] > 0 { REP3_SYM }
+                            else { t.dist_code as usize };
+                        df[sym] += 1;
+                        rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = md;
+                    }
                 }
                 llf[0][END_BLOCK as usize] += 1;
                 for ctx in 0..NUM_CTX {
