@@ -296,6 +296,7 @@ const CTR_LIMIT: u16 = 1020;
 const MIX_N: usize = 5;
 const MIX_LR: i32 = 6;
 const MIX_SHIFT: u32 = 14;
+const APM_RATE: u32 = 7;
 
 struct LitMix {
     squash: Vec<i32>,   // index d+2048
@@ -312,6 +313,8 @@ struct LitMix {
     i1: usize,
     i2: usize,
     i3: usize,
+    apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
+    apm_idx: usize,
 }
 
 impl LitMix {
@@ -336,6 +339,13 @@ impl LitMix {
             o2_mask: (1 << o2_bits) - 1,
             w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 0]; 16],
             st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0, i3: 0,
+            apm: {
+                let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
+                let mut v = Vec::with_capacity(65536 * 33);
+                for _ in 0..65536 { v.extend_from_slice(&row); }
+                v
+            },
+            apm_idx: 0,
         }
     }
 
@@ -356,7 +366,14 @@ impl LitMix {
         let mut dot: i64 = 0;
         for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; }
         self.pr = self.sq((dot >> 16) as i32).clamp(1, 4095);
-        self.pr as u32
+        // APM / SSE refinement in context (prev byte, partial literal)
+        let sv = self.stretch[self.pr as usize] + 2048;
+        let lo = (sv >> 7) as usize;
+        let w = sv & 127;
+        let base = i1 * 33 + lo;
+        self.apm_idx = base + (w >> 6) as usize;
+        let pa = ((self.apm[base] as i32 * (128 - w) + self.apm[base + 1] as i32 * w) >> 11).clamp(1, 4095);
+        ((self.pr + 3 * pa) >> 2).clamp(1, 4095) as u32
     }
 
     #[inline]
@@ -365,6 +382,8 @@ impl LitMix {
         let w = &mut self.w[self.set];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
+        let a = &mut self.apm[self.apm_idx];
+        *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
         for c in [&mut self.o1[self.i1], &mut self.o2[self.i2], &mut self.o3[self.i3]] {
             let r = self.recip[c.n as usize];
             c.p = (c.p as i32 + (((target - c.p as i32) * r) >> 16)) as u16;
