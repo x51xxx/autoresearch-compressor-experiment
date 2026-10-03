@@ -305,169 +305,12 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
         // Step 2: Block-based DP — process in 256KB chunks for cache efficiency.
         // Match arrays (match_ml etc.) are full-file; DP arrays are block-scoped.
         // Matches still reference the full window (8MB); only DP state is local.
-        const DP_BLOCK: usize = 262144; // 256KB — fits in L2 cache
-        let bsz = DP_BLOCK.min(len);
-        let mut cost = vec![u64::MAX; bsz + MAX_MATCH + 1];
-        let mut prev_info = vec![0u64; bsz + MAX_MATCH + 1];
-        let mut dp_rep_arr = vec![0u32; bsz + MAX_MATCH + 1];
-        let mut dp_rep1_arr = vec![0u32; bsz + MAX_MATCH + 1];
-        let mut dp_rep2_arr = vec![0u32; bsz + MAX_MATCH + 1];
+        let mm = MatchArrays { ml: match_ml, md: match_md, ml2: match2_ml, md2: match2_md };
         let num_dp_passes = if len > 500_000 { 2 } else { 4 };
 
         for iteration in 0..num_dp_passes {
-            tokens.clear();
-            let mut carry_rep = [0u32; 3];
-            let mut carry_prev_byte: u8 = 0;
-            let mut block_start = 0usize;
-
-            while block_start < len {
-                let block_end = (block_start + bsz).min(len);
-                let blen = block_end - block_start;
-                // Allow DP transitions to extend past block_end by up to MAX_MATCH
-                let dp_end = (blen + MAX_MATCH).min(len - block_start);
-
-                // Reset DP arrays for this block
-                for j in 0..=dp_end { cost[j] = u64::MAX; prev_info[j] = 0;
-                    dp_rep_arr[j] = 0; dp_rep1_arr[j] = 0; dp_rep2_arr[j] = 0; }
-                cost[0] = 0;
-                dp_rep_arr[0] = carry_rep[0];
-                dp_rep1_arr[0] = carry_rep[1];
-                dp_rep2_arr[0] = carry_rep[2];
-
-                // DP forward pass within block (local index j = absolute i - block_start)
-                for j in 0..blen {
-                    let i = block_start + j; // absolute position in input
-                    let ci = cost[j];
-                    if ci == u64::MAX { continue; }
-
-                    let ctx = if i > 0 { CTX_TABLE[input[i - 1] as usize] as usize } else { 0 };
-                    let rep_d = dp_rep_arr[j] as usize;
-                    let rep_d1 = dp_rep1_arr[j] as usize;
-                    let rep_d2 = dp_rep2_arr[j] as usize;
-
-                    // Literal
-                    let lc = ci + lit_price(input[i], ctx, &ll_prices);
-                    if lc < cost[j + 1] {
-                        cost[j + 1] = lc;
-                        prev_info[j + 1] = 0;
-                        dp_rep_arr[j + 1] = rep_d as u32;
-                        dp_rep1_arr[j + 1] = rep_d1 as u32;
-                        dp_rep2_arr[j + 1] = rep_d2 as u32;
-                    }
-
-                    // Rep-distance match
-                    let rep_dists = [rep_d, rep_d1, rep_d2];
-                    let rep_prices_arr = [dist_prices[REP0_SYM] as u64, dist_prices[REP1_SYM] as u64, dist_prices[REP2_SYM] as u64];
-                    for rep_slot in 0..3 {
-                        let rd = rep_dists[rep_slot];
-                        if rd == 0 || rd > i || i + MIN_MATCH > len { continue; }
-                        let src = i - rd;
-                        let dp_ptr = input.as_ptr();
-                        let max_rl = std::cmp::min(MAX_MATCH, len - i);
-                        let mut rlen = 0usize;
-                        let safe_rl = if max_rl >= 8 { max_rl - 7 } else { 0 };
-                        while rlen < safe_rl {
-                            let a = unsafe { std::ptr::read_unaligned(dp_ptr.add(src + rlen) as *const u64) };
-                            let b = unsafe { std::ptr::read_unaligned(dp_ptr.add(i + rlen) as *const u64) };
-                            if a != b { rlen += (a ^ b).trailing_zeros() as usize / 8; break; }
-                            rlen += 8;
-                        }
-                        while rlen < max_rl && unsafe { *dp_ptr.add(src + rlen) == *dp_ptr.add(i + rlen) } {
-                            rlen += 1;
-                        }
-                        if rlen >= MIN_MATCH {
-                            let try_lens: &[usize] = if len > 1_000_000 {
-                                &[3,4,6,10,19,67,258,rlen,0]
-                            } else {
-                                &[3,4,5,6,7,8,10,13,19,67,258,rlen,0]
-                            };
-                            for &tl in try_lens {
-                                if tl == 0 || tl > rlen || tl < MIN_MATCH { continue; }
-                                let target = j + tl;
-                                if target > dp_end { continue; }
-                                let (li2, _, lb2) = len_to_code(tl);
-                                let mc = ci + ll_prices[ctx][257 + li2] as u64 + (lb2 as u64) * 256 + rep_prices_arr[rep_slot];
-                                if mc < cost[target] {
-                                    cost[target] = mc;
-                                    prev_info[target] = 0x8000_0000_0000_0000u64 | ((tl as u64) << 32) | (rd as u64);
-                                    dp_rep_arr[target] = rd as u32;
-                                    dp_rep1_arr[target] = if rep_slot == 0 { rep_d1 as u32 } else { rep_d as u32 };
-                                    dp_rep2_arr[target] = if rep_slot <= 1 { rep_d2 as u32 } else { rep_d1 as u32 };
-                                }
-                            }
-                        }
-                    }
-
-                    // Normal match
-                    for slot in 0..2 {
-                        let ml = if slot == 0 { match_ml[i] as usize } else { match2_ml[i] as usize };
-                        if ml < MIN_MATCH { continue; }
-                        let md = if slot == 0 { match_md[i] as usize } else { match2_md[i] as usize };
-                        let (di, _, db) = dist_to_code(md);
-                        let dist_cost = dist_prices[di] as u64 + (db as u64) * 256;
-
-                        let try_lens: &[usize] = if len > 1_000_000 {
-                            // Sparse for large files (speed)
-                            &[3,4,5,6,7,8,10,13,19,31,67,131,258,ml,0]
-                        } else {
-                            // Dense for small files (ratio)
-                            &[3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
-                              21,22,23,24,25,26,27,28,29,30,31,32,
-                              43,67,131,258,515,ml,0]
-                        };
-                        for &tl in try_lens {
-                            if tl == 0 || tl > ml || tl < MIN_MATCH { continue; }
-                            let target = j + tl;
-                            if target > dp_end { continue; }
-                            let (li, _, lb) = len_to_code(tl);
-                            let mc = ci + ll_prices[ctx][257 + li] as u64 + (lb as u64) * 256 + dist_cost;
-                            if mc < cost[target] {
-                                cost[target] = mc;
-                                prev_info[target] = 0x8000_0000_0000_0000u64 | ((tl as u64) << 32) | (md as u64);
-                                dp_rep2_arr[target] = rep_d1 as u32;
-                                dp_rep1_arr[target] = rep_d as u32;
-                                dp_rep_arr[target] = md as u32;
-                            }
-                        }
-                    }
-                }
-
-                // Backtrack within this block
-                let mut path: Vec<u64> = Vec::new();
-                let mut cur = blen; // backtrack from block end
-                while cur > 0 {
-                    let info = prev_info[cur];
-                    path.push(info);
-                    if info & 0x8000_0000_0000_0000 != 0 {
-                        cur -= ((info >> 32) & 0x7FFF_FFFF) as usize;
-                    } else { cur -= 1; }
-                }
-                path.reverse();
-
-                let mut pos = block_start;
-                let mut prev_byte = carry_prev_byte;
-                for &info in &path {
-                    if info & 0x8000_0000_0000_0000 != 0 {
-                        let ml = ((info >> 32) & 0x7FFF_FFFF) as usize;
-                        let md = (info & 0xFFFF_FFFF) as usize;
-                        tokens.push(make_match_tok(ml, md, prev_byte));
-                        let match_source = pos - md;
-                        prev_byte = input[match_source + ml - 1];
-                        pos += ml;
-                    } else {
-                        tokens.push(make_lit_tok(input[pos], prev_byte));
-                        prev_byte = input[pos];
-                        pos += 1;
-                    }
-                }
-
-                // Carry over state for next block
-                carry_rep[0] = dp_rep_arr[blen];
-                carry_rep[1] = dp_rep1_arr[blen];
-                carry_rep[2] = dp_rep2_arr[blen];
-                carry_prev_byte = prev_byte;
-                block_start = pos; // advance past whatever the backtrack consumed
-            }
+            let pr = Prices::from_huffman(&ll_prices, &dist_prices);
+            tokens = dp_parse(input, &mm, &pr, false);
 
             // After each non-final iteration: rebuild prices from Huffman code lengths
             if iteration < num_dp_passes - 1 {
@@ -825,6 +668,268 @@ fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
     }
     output.extend_from_slice(&enc.finish());
     output
+}
+
+/// Per-pass price tables for the DP (8.8 fixed-point bits).
+struct Prices {
+    lit: [[u32; 256]; NUM_CTX],
+    mlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a normal match (incl. flags)
+    rlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a rep match (incl. flags)
+    rep: [u32; 3],
+    dist: [u32; NUM_DIST],
+}
+
+impl Prices {
+    fn from_huffman(ll: &[[u16; NUM_LITLEN]; NUM_CTX], dist: &[u16; NUM_DIST]) -> Self {
+        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
+                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [0; NUM_DIST] };
+        for c in 0..NUM_CTX {
+            for b in 0..256 { pr.lit[c][b] = ll[c][b] as u32; }
+            for l in MIN_MATCH..=MAX_MATCH {
+                let (li, _, lb) = len_to_code(l);
+                pr.mlen[c][l] = ll[c][257 + li] as u32 + lb * 256;
+            }
+            pr.rlen[c] = pr.mlen[c];
+        }
+        pr.rep = [dist[REP0_SYM] as u32, dist[REP1_SYM] as u32, dist[REP2_SYM] as u32];
+        for d in 0..NUM_DIST { pr.dist[d] = dist[d] as u32; }
+        pr
+    }
+
+    /// Static approximation of the adaptive LZMA backend's costs, estimated from a parse.
+    fn from_lzma_stats(tokens: &[Tok]) -> Self {
+        fn bits(c: f64, tot: f64) -> u32 { ((-(c / tot).log2()) * 256.0).clamp(8.0, 8192.0) as u32 }
+        let mut lit_cnt = [[0u32; 256]; 8];
+        let mut n_lit = [0u32; 8];
+        let mut n_match = [0u32; 8];
+        let mut rep_cnt = [0u32; 5]; // rep0..rep3, normal
+        let mut mlen_cnt = vec![0u32; MAX_MATCH + 1];
+        let mut rlen_cnt = vec![0u32; MAX_MATCH + 1];
+        let mut slot_cnt = [0u32; NUM_DIST_CODES];
+        let mut rep = [0u32; 4];
+        for t in tokens {
+            let c = (t.prev_byte >> 5) as usize;
+            if t.sym < 256 { lit_cnt[c][t.sym as usize] += 1; n_lit[c] += 1; continue; }
+            n_match[c] += 1;
+            let li = (t.sym - 257) as usize;
+            let ml = LEN_CODE_BASE[li] as usize + t.len_extra as usize;
+            let md = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra;
+            if let Some(k) = rep.iter().position(|&r| r == md && r > 0) {
+                rep_cnt[k] += 1; rlen_cnt[ml] += 1;
+                let d = rep[k]; for q in (1..=k).rev() { rep[q] = rep[q - 1]; } rep[0] = d;
+            } else {
+                rep_cnt[4] += 1; mlen_cnt[ml] += 1; slot_cnt[t.dist_code as usize] += 1;
+                rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = md;
+            }
+        }
+        fn len_prices(cnt: &[u32]) -> Vec<u32> {
+            // LZMA length coder buckets: low 8, mid 8, high 1024
+            let tot: f64 = cnt.iter().sum::<u32>() as f64;
+            let bucket = |l: usize| if l < MIN_MATCH + 8 { 0 } else if l < MIN_MATCH + 16 { 1 } else { 2 };
+            let mut bc = [0f64; 3];
+            for l in MIN_MATCH..=MAX_MATCH { bc[bucket(l)] += cnt[l] as f64; }
+            let sizes = [8.0, 8.0, (MAX_MATCH + 1 - MIN_MATCH - 16) as f64];
+            let mut out = vec![0u32; MAX_MATCH + 1];
+            for l in MIN_MATCH..=MAX_MATCH {
+                let b = bucket(l);
+                let pb = (bc[b] + 0.5) / (tot + 1.5);
+                let alpha = if b == 2 { 0.05 } else { 0.5 };
+                let pv = (cnt[l] as f64 + alpha) / (bc[b] + alpha * sizes[b]);
+                out[l] = bits(pb * pv, 1.0);
+            }
+            out
+        }
+        let mlp = len_prices(&mlen_cnt);
+        let rlp = len_prices(&rlen_cnt);
+        let n_m: f64 = rep_cnt.iter().sum::<u32>() as f64 + 2.5;
+        let normal = bits(rep_cnt[4] as f64 + 0.5, n_m);
+        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
+                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [12 * 256; NUM_DIST] };
+        for k in 0..3 { pr.rep[k] = bits(rep_cnt[k] as f64 + 0.5, n_m); }
+        let n_s: f64 = slot_cnt.iter().sum::<u32>() as f64;
+        for d in 0..NUM_DIST_CODES { pr.dist[d] = bits(slot_cnt[d] as f64 + 0.5, n_s + 0.5 * NUM_DIST_CODES as f64); }
+        for c in 0..8 {
+            let tot = (n_lit[c] + n_match[c]) as f64 + 1.0;
+            let p_lit = bits(n_lit[c] as f64 + 0.5, tot);
+            let p_match = bits(n_match[c] as f64 + 0.5, tot);
+            for b in 0..256 {
+                pr.lit[c][b] = p_lit + bits(lit_cnt[c][b] as f64 + 0.5, n_lit[c] as f64 + 128.0);
+            }
+            for l in MIN_MATCH..=MAX_MATCH {
+                pr.mlen[c][l] = p_match + normal + mlp[l];
+                pr.rlen[c][l] = p_match + rlp[l];
+            }
+        }
+        pr
+    }
+}
+
+struct MatchArrays { ml: Vec<u16>, md: Vec<u32>, ml2: Vec<u16>, md2: Vec<u32> }
+
+/// Block-based forward DP optimal parse under the given price tables.
+/// `lzma`: literal context = prev_byte >> 5 (LZMA lc=3) instead of CTX_TABLE classes.
+fn dp_parse(input: &[u8], mm: &MatchArrays, pr: &Prices, lzma: bool) -> Vec<Tok> {
+    let len = input.len();
+    let (match_ml, match_md, match2_ml, match2_md) = (&mm.ml, &mm.md, &mm.ml2, &mm.md2);
+    const DP_BLOCK: usize = 262144; // 256KB — fits in L2 cache
+    let bsz = DP_BLOCK.min(len);
+    let mut cost = vec![u64::MAX; bsz + MAX_MATCH + 1];
+    let mut prev_info = vec![0u64; bsz + MAX_MATCH + 1];
+    let mut dp_rep_arr = vec![0u32; bsz + MAX_MATCH + 1];
+    let mut dp_rep1_arr = vec![0u32; bsz + MAX_MATCH + 1];
+    let mut dp_rep2_arr = vec![0u32; bsz + MAX_MATCH + 1];
+    let mut tokens: Vec<Tok> = Vec::with_capacity(len / 2);
+    let mut carry_rep = [0u32; 3];
+    let mut carry_prev_byte: u8 = 0;
+    let mut block_start = 0usize;
+
+    while block_start < len {
+        let block_end = (block_start + bsz).min(len);
+        let blen = block_end - block_start;
+        // Allow DP transitions to extend past block_end by up to MAX_MATCH
+        let dp_end = (blen + MAX_MATCH).min(len - block_start);
+
+        // Reset DP arrays for this block
+        for j in 0..=dp_end { cost[j] = u64::MAX; prev_info[j] = 0;
+            dp_rep_arr[j] = 0; dp_rep1_arr[j] = 0; dp_rep2_arr[j] = 0; }
+        cost[0] = 0;
+        dp_rep_arr[0] = carry_rep[0];
+        dp_rep1_arr[0] = carry_rep[1];
+        dp_rep2_arr[0] = carry_rep[2];
+
+        // DP forward pass within block (local index j = absolute i - block_start)
+        for j in 0..blen {
+            let i = block_start + j; // absolute position in input
+            let ci = cost[j];
+            if ci == u64::MAX { continue; }
+
+            let ctx = if i > 0 { if lzma { (input[i - 1] >> 5) as usize } else { CTX_TABLE[input[i - 1] as usize] as usize } } else { 0 };
+            let rep_d = dp_rep_arr[j] as usize;
+            let rep_d1 = dp_rep1_arr[j] as usize;
+            let rep_d2 = dp_rep2_arr[j] as usize;
+
+            // Literal
+            let lc = ci + pr.lit[ctx][input[i] as usize] as u64;
+            if lc < cost[j + 1] {
+                cost[j + 1] = lc;
+                prev_info[j + 1] = 0;
+                dp_rep_arr[j + 1] = rep_d as u32;
+                dp_rep1_arr[j + 1] = rep_d1 as u32;
+                dp_rep2_arr[j + 1] = rep_d2 as u32;
+            }
+
+            // Rep-distance match
+            let rep_dists = [rep_d, rep_d1, rep_d2];
+            let rep_prices_arr = [pr.rep[0] as u64, pr.rep[1] as u64, pr.rep[2] as u64];
+            for rep_slot in 0..3 {
+                let rd = rep_dists[rep_slot];
+                if rd == 0 || rd > i || i + MIN_MATCH > len { continue; }
+                let src = i - rd;
+                let dp_ptr = input.as_ptr();
+                let max_rl = std::cmp::min(MAX_MATCH, len - i);
+                let mut rlen = 0usize;
+                let safe_rl = if max_rl >= 8 { max_rl - 7 } else { 0 };
+                while rlen < safe_rl {
+                    let a = unsafe { std::ptr::read_unaligned(dp_ptr.add(src + rlen) as *const u64) };
+                    let b = unsafe { std::ptr::read_unaligned(dp_ptr.add(i + rlen) as *const u64) };
+                    if a != b { rlen += (a ^ b).trailing_zeros() as usize / 8; break; }
+                    rlen += 8;
+                }
+                while rlen < max_rl && unsafe { *dp_ptr.add(src + rlen) == *dp_ptr.add(i + rlen) } {
+                    rlen += 1;
+                }
+                if rlen >= MIN_MATCH {
+                    let try_lens: &[usize] = if len > 1_000_000 {
+                        &[3,4,6,10,19,67,258,rlen,0]
+                    } else {
+                        &[3,4,5,6,7,8,10,13,19,67,258,rlen,0]
+                    };
+                    for &tl in try_lens {
+                        if tl == 0 || tl > rlen || tl < MIN_MATCH { continue; }
+                        let target = j + tl;
+                        if target > dp_end { continue; }
+                        let mc = ci + pr.rlen[ctx][tl] as u64 + rep_prices_arr[rep_slot];
+                        if mc < cost[target] {
+                            cost[target] = mc;
+                            prev_info[target] = 0x8000_0000_0000_0000u64 | ((tl as u64) << 32) | (rd as u64);
+                            dp_rep_arr[target] = rd as u32;
+                            dp_rep1_arr[target] = if rep_slot == 0 { rep_d1 as u32 } else { rep_d as u32 };
+                            dp_rep2_arr[target] = if rep_slot <= 1 { rep_d2 as u32 } else { rep_d1 as u32 };
+                        }
+                    }
+                }
+            }
+
+            // Normal match
+            for slot in 0..2 {
+                let ml = if slot == 0 { match_ml[i] as usize } else { match2_ml[i] as usize };
+                if ml < MIN_MATCH { continue; }
+                let md = if slot == 0 { match_md[i] as usize } else { match2_md[i] as usize };
+                let (di, _, db) = dist_to_code(md);
+                let dist_cost = pr.dist[di] as u64 + (db as u64) * 256;
+
+                let try_lens: &[usize] = if len > 1_000_000 {
+                    // Sparse for large files (speed)
+                    &[3,4,5,6,7,8,10,13,19,31,67,131,258,ml,0]
+                } else {
+                    // Dense for small files (ratio)
+                    &[3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                      21,22,23,24,25,26,27,28,29,30,31,32,
+                      43,67,131,258,515,ml,0]
+                };
+                for &tl in try_lens {
+                    if tl == 0 || tl > ml || tl < MIN_MATCH { continue; }
+                    let target = j + tl;
+                    if target > dp_end { continue; }
+                    let mc = ci + pr.mlen[ctx][tl] as u64 + dist_cost;
+                    if mc < cost[target] {
+                        cost[target] = mc;
+                        prev_info[target] = 0x8000_0000_0000_0000u64 | ((tl as u64) << 32) | (md as u64);
+                        dp_rep2_arr[target] = rep_d1 as u32;
+                        dp_rep1_arr[target] = rep_d as u32;
+                        dp_rep_arr[target] = md as u32;
+                    }
+                }
+            }
+        }
+
+        // Backtrack within this block
+        let mut path: Vec<u64> = Vec::new();
+        let mut cur = blen; // backtrack from block end
+        while cur > 0 {
+            let info = prev_info[cur];
+            path.push(info);
+            if info & 0x8000_0000_0000_0000 != 0 {
+                cur -= ((info >> 32) & 0x7FFF_FFFF) as usize;
+            } else { cur -= 1; }
+        }
+        path.reverse();
+
+        let mut pos = block_start;
+        let mut prev_byte = carry_prev_byte;
+        for &info in &path {
+            if info & 0x8000_0000_0000_0000 != 0 {
+                let ml = ((info >> 32) & 0x7FFF_FFFF) as usize;
+                let md = (info & 0xFFFF_FFFF) as usize;
+                tokens.push(make_match_tok(ml, md, prev_byte));
+                let match_source = pos - md;
+                prev_byte = input[match_source + ml - 1];
+                pos += ml;
+            } else {
+                tokens.push(make_lit_tok(input[pos], prev_byte));
+                prev_byte = input[pos];
+                pos += 1;
+            }
+        }
+
+        // Carry over state for next block
+        carry_rep[0] = dp_rep_arr[blen];
+        carry_rep[1] = dp_rep1_arr[blen];
+        carry_rep[2] = dp_rep2_arr[blen];
+        carry_prev_byte = prev_byte;
+        block_start = pos; // advance past whatever the backtrack consumed
+    }
+    tokens
 }
 
 fn compute_end_prev_byte(input: &[u8], tokens: &[Tok]) -> u8 {
