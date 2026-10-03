@@ -296,6 +296,7 @@ const CTR_LIMIT: u16 = 1020;
 const NH: usize = 5;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
 const MIX_LR: i32 = 6;
+const FIN_LR: i32 = 2;
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
 const APM2_BITS: u32 = 16;
@@ -343,6 +344,8 @@ struct LitMix {
     pr: i32,
     pr1: i32, pr2: i32,
     set: usize, set2: usize,
+    wf: Vec<[i32; 3]>, // final 2-input mixer, selected by bit position x matched
+    fin: [i32; 3], fset: usize,
     i1: usize,
     hi: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
@@ -375,7 +378,8 @@ impl LitMix {
             h_mask: (1 << h_bits) - 1,
             w: vec![w0; 16 * 9],
             w2: vec![w0; 256 * 2],
-            st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0, i1: 0, hi: [0; NH],
+            st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0,
+            wf: vec![[32768, 32768, 0]; 16], fin: [0; 3], fset: 0, i1: 0, hi: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -425,7 +429,11 @@ impl LitMix {
         let (d1, d2) = ((dot >> 16) as i32, (dot2 >> 16) as i32);
         self.pr1 = self.sq(d1).clamp(1, 4095);
         self.pr2 = self.sq(d2).clamp(1, 4095);
-        self.pr = self.sq((d1 + d2) >> 1).clamp(1, 4095);
+        self.fin = [d1.clamp(-2047, 2047), d2.clamp(-2047, 2047), 256];
+        self.fset = set;
+        let wf = &self.wf[set];
+        let df = (self.fin[0] as i64 * wf[0] as i64 + self.fin[1] as i64 * wf[1] as i64 + self.fin[2] as i64 * wf[2] as i64) >> 16;
+        self.pr = self.sq(df as i32).clamp(1, 4095);
         // APM / SSE refinement in context (prev byte, partial literal)
         let sv = self.stretch[self.pr as usize] + 2048;
         let lo = (sv >> 7) as usize;
@@ -445,6 +453,9 @@ impl LitMix {
         let err = (((bit as i32) << 12) - self.pr1) * MIX_LR;
         let w = &mut self.w[self.set];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        let errf = (((bit as i32) << 12) - self.pr) * FIN_LR;
+        let wf = &mut self.wf[self.fset];
+        for k in 0..3 { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
         let err = (((bit as i32) << 12) - self.pr2) * MIX_LR;
         let w = &mut self.w2[self.set2];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
