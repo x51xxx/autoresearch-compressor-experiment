@@ -299,6 +299,7 @@ const NH: usize = 7;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
 const MIX_LR: i32 = 4;
 const FIN_LR: i32 = 2;
+const NB: usize = 4; // mixer weight banks
 const MIX_LR0: i32 = 6; // extra learning rate at the start, decays over ~256K bits
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
@@ -350,16 +351,16 @@ struct LitMix {
     o1: Vec<Ctr>,
     ht: Vec<Vec<Ctr>>,
     h_mask: usize,
-    w: Vec<[i32; MIX_N]>,
-    w2: Vec<[i32; MIX_N]>, // second weight bank selected by prev byte
-    w3: Vec<[i32; MIX_N]>, // third weight bank selected by partial byte (node)
-    pr3: i32, set3: usize,
+    /// Weight banks, selected by: bitpos x matched x ctx confidence; prev byte x matched;
+    /// partial byte x matched; order-2 hash bucket.
+    wb: [Vec<[i32; MIX_N]>; NB],
+    sets: [usize; NB],
+    prs: [i32; NB],
     st: [i32; MIX_N],
     pr: i32,
-    pr1: i32, pr2: i32,
-    set: usize, set2: usize,
-    wf: Vec<[i32; 4]>, // final 3-input mixer, selected by bit position x matched
-    fin: [i32; 4], fset: usize,
+    set: usize,
+    wf: Vec<[i32; NB + 1]>, // final mixer over the banks, selected by bit position x matched
+    fin: [i32; NB + 1], fset: usize,
     nbits: u32, // coded literal bits, for the decaying mixer learning rate
     i1: usize,
     hi: [usize; NH],
@@ -392,11 +393,10 @@ impl LitMix {
             o1: vec![CTR_INIT; 1 << 16],
             ht: (0..NH).map(|_| vec![CTR_INIT; 1 << h_bits]).collect(),
             h_mask: (1 << h_bits) - 1,
-            w: vec![w0; 16 * 9],
-            w2: vec![w0; 256 * 2],
-            w3: vec![w0; 256 * 2], pr3: 2048, set3: 0,
-            st: [0; MIX_N], pr: 2048, pr1: 2048, pr2: 2048, set: 0, set2: 0,
-            wf: vec![[21845, 21845, 21845, 0]; 16], fin: [0; 4], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
+            wb: [vec![w0; 16 * 9], vec![w0; 256 * 2], vec![w0; 256 * 2], vec![w0; 1024]],
+            sets: [0; NB], prs: [2048; NB],
+            st: [0; MIX_N], pr: 2048, set: 0,
+            wf: vec![{ let mut f = [65536 / NB as i32; NB + 1]; f[NB] = 0; f }; 16], fin: [0; NB + 1], fset: 0, nbits: 0, i1: 0, hi: [0; NH], slot: [0; NH],
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -458,22 +458,20 @@ impl LitMix {
         let n2 = self.ht[0][self.hi[0]].n; let n3 = self.ht[1][self.hi[1]].n;
         let conf = if n2 == 0 { 0 } else if n3 == 0 { 1 } else if n3 < 4 { 2 } else { 3 + (n3 >= 16) as usize + (n3 >= 64) as usize };
         self.set = set * 9 + conf;
-        self.set2 = ((i1 >> 8) << 1) | (set >= 8) as usize;
-        self.set3 = ((node as usize & 0xFF) << 1) | (set >= 8) as usize;
-        let (w, w2, w3) = (&self.w[self.set], &self.w2[self.set2], &self.w3[self.set3]);
-        let (mut dot, mut dot2, mut dot3) = (0i64, 0i64, 0i64);
-        for k in 0..MIX_N {
-            let x = self.st[k] as i64;
-            dot += x * w[k] as i64; dot2 += x * w2[k] as i64; dot3 += x * w3[k] as i64;
+        let m = (set >= 8) as usize;
+        self.sets = [self.set, ((i1 >> 8) << 1) | m, ((node as usize & 0xFF) << 1) | m, (hs[0] >> 22) as usize];
+        for b in 0..NB {
+            let w = &self.wb[b][self.sets[b]];
+            let mut dot = 0i64;
+            for k in 0..MIX_N { dot += self.st[k] as i64 * w[k] as i64; }
+            let d = ((dot >> 16) as i32).clamp(-2047, 2047);
+            self.fin[b] = d;
+            self.prs[b] = self.sq(d).clamp(1, 4095);
         }
-        let (d1, d2, d3) = ((dot >> 16) as i32, (dot2 >> 16) as i32, (dot3 >> 16) as i32);
-        self.pr1 = self.sq(d1).clamp(1, 4095);
-        self.pr2 = self.sq(d2).clamp(1, 4095);
-        self.pr3 = self.sq(d3).clamp(1, 4095);
-        self.fin = [d1.clamp(-2047, 2047), d2.clamp(-2047, 2047), d3.clamp(-2047, 2047), 256];
+        self.fin[NB] = 256;
         self.fset = set;
         let wf = &self.wf[set];
-        let df = (0..4).map(|k| self.fin[k] as i64 * wf[k] as i64).sum::<i64>() >> 16;
+        let df = (0..=NB).map(|k| self.fin[k] as i64 * wf[k] as i64).sum::<i64>() >> 16;
         self.pr = self.sq(df as i32).clamp(1, 4095);
         // APM / SSE refinement in context (prev byte, partial literal)
         let sv = self.stretch[self.pr as usize] + 2048;
@@ -493,18 +491,14 @@ impl LitMix {
     fn update(&mut self, bit: u32) {
         self.nbits = self.nbits.saturating_add(1);
         let lr = MIX_LR + ((MIX_LR0 << 16) / ((1 << 16) + self.nbits as i32 / 4));
-        let err = (((bit as i32) << 12) - self.pr1) * lr;
-        let w = &mut self.w[self.set];
-        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        for b in 0..NB {
+            let err = (((bit as i32) << 12) - self.prs[b]) * lr;
+            let w = &mut self.wb[b][self.sets[b]];
+            for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        }
         let errf = (((bit as i32) << 12) - self.pr) * FIN_LR;
         let wf = &mut self.wf[self.fset];
-        for k in 0..4 { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
-        let err = (((bit as i32) << 12) - self.pr3) * lr;
-        let w = &mut self.w3[self.set3];
-        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
-        let err = (((bit as i32) << 12) - self.pr2) * lr;
-        let w = &mut self.w2[self.set2];
-        for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
+        for k in 0..=NB { wf[k] += (self.fin[k] * errf) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
         let a = &mut self.apm[self.apm_idx];
         *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
