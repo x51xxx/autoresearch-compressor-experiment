@@ -292,10 +292,10 @@ fn squash_i(d: i32) -> i32 {
 struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
 const CTR_LIMIT: u16 = 1020;
-/// Per hashed context (o2, o3, o4, o6, word, sparse, bigram).
-const CTR_LIMIT_HI: [u16; NH] = [1020, 1020, 255, 127, 255, 1020, 127];
+/// Per hashed context (o2, o3, o4, o6, word, sparse, bigram, indirect o2).
+const CTR_LIMIT_HI: [u16; NH] = [1020, 1020, 255, 127, 255, 1020, 127, 1020];
 /// Hashed literal contexts: order-2, order-3, order-4, order-6, current word.
-const NH: usize = 7;
+const NH: usize = 8;
 const MIX_N: usize = NH + 4; // LZMA lit prob, order-1, hashed..., match model, bias
 const MIX_LR: i32 = 4;
 const FIN_LR: i32 = 2;
@@ -318,20 +318,23 @@ struct Lc { h: [u32; NH], exp: u32, mlen: u32 }
 /// Incremental literal context: byte history, current word hash, previous word hash, and a
 /// match model (last position of each order-MM_MIN context; follows the match while it holds).
 /// `at(buf, pos)` catches up on the bytes before `pos` (all known to both sides).
-struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64, mm: Vec<u32>, mm_shift: u32, mptr: usize, mlen: u32 }
+struct Ctx { pos: usize, hist: u64, word: u64, prevw: u64, mm: Vec<u32>, mm_shift: u32, mptr: usize, mlen: u32, ind2: Vec<u16> }
 
 const MM_MIN: usize = 5;
 
 impl Ctx {
     fn new(input_len: usize) -> Self {
         let bits = (input_len.max(1 << 12).next_power_of_two().trailing_zeros() + 1).min(22);
-        Ctx { pos: 0, hist: 0, word: 0, prevw: 0, mm: vec![0; 1 << bits], mm_shift: 64 - bits, mptr: 0, mlen: 0 }
+        Ctx { pos: 0, hist: 0, word: 0, prevw: 0, mm: vec![0; 1 << bits], mm_shift: 64 - bits, mptr: 0, mlen: 0, ind2: vec![0; 1 << 16] }
     }
 
     #[inline]
     fn at(&mut self, buf: &[u8], pos: usize) -> Lc {
         while self.pos < pos {
             let b = buf[self.pos];
+            // indirect: the two bytes that followed the last occurrence of the order-2 context
+            let c2 = (self.hist & 0xFFFF) as usize;
+            self.ind2[c2] = (self.ind2[c2] << 8) | b as u16;
             if self.mlen > 0 && buf[self.mptr] == b { self.mlen += 1; self.mptr += 1; } else { self.mlen = 0; }
             self.hist = (self.hist << 8) | b as u64;
             if b.is_ascii_alphabetic() || b >= 0x80 {
@@ -348,17 +351,19 @@ impl Ctx {
             }
         }
         let exp = if self.mlen > 0 { 0x100 | buf[self.mptr] as u32 } else { 0 };
-        Lc { h: ctx_from(self.hist, self.word, self.prevw), exp, mlen: self.mlen }
+        let ind = self.ind2[(self.hist & 0xFFFF) as usize] as u64;
+        Lc { h: ctx_from(self.hist, self.word, self.prevw, ind), exp, mlen: self.mlen }
     }
 }
 
 #[inline]
-fn ctx_from(h8: u64, w: u64, pw: u64) -> [u32; NH] {
+fn ctx_from(h8: u64, w: u64, pw: u64, ind: u64) -> [u32; NH] {
     let w = if w == 0 { 0x5555 + (h8 & 0xFF) } else { w };
 
     [hmix(h8 & 0xFFFF, 2), hmix(h8 & 0xFF_FFFF, 3), hmix(h8 & 0xFFFF_FFFF, 4),
      hmix(h8 & 0xFFFF_FFFF_FFFF, 6), hmix(w, 7), hmix(h8 & 0xFF_FF00, 8),
-     hmix(w ^ pw.rotate_left(29), 10)]
+     hmix(w ^ pw.rotate_left(29), 10),
+     hmix((ind << 16) | (h8 & 0xFFFF), 11)]
 }
 
 struct LitMix {
