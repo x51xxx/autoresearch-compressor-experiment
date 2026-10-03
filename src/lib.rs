@@ -684,17 +684,23 @@ fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
 struct Prices {
     lit: [[u32; 256]; NUM_CTX],
     /// Optional per-position literal cost (adaptive model) + per-ctx literal flag cost.
-    lit_pos: Option<(Vec<u32>, [u32; NUM_CTX])>,
+    lit_pos: Option<Vec<u32>>,
     mlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a normal match (incl. flags)
     rlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a rep match (incl. flags)
     rep: [u32; 3],
     dist: [u32; NUM_DIST],
+    /// State-dependent flag costs, [s][ctx], s = 1 if the previous token was a match.
+    st_lit: [[u32; NUM_CTX]; 2],
+    st_match: [[u32; NUM_CTX]; 2],
+    /// [s][k]: rep-k (k<3) / normal (k=3) selection cost.
+    st_rep: [[u32; 4]; 2],
 }
 
 impl Prices {
     fn from_huffman(ll: &[[u16; NUM_LITLEN]; NUM_CTX], dist: &[u16; NUM_DIST]) -> Self {
         let mut pr = Prices { lit: [[0; 256]; NUM_CTX], lit_pos: None, mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
-                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [0; NUM_DIST] };
+                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [0; NUM_DIST],
+                              st_lit: [[0; NUM_CTX]; 2], st_match: [[0; NUM_CTX]; 2], st_rep: [[0; 4]; 2] };
         for c in 0..NUM_CTX {
             for b in 0..256 { pr.lit[c][b] = ll[c][b] as u32; }
             for l in MIN_MATCH..=MAX_MATCH {
@@ -704,6 +710,7 @@ impl Prices {
             pr.rlen[c] = pr.mlen[c];
         }
         pr.rep = [dist[REP0_SYM] as u32, dist[REP1_SYM] as u32, dist[REP2_SYM] as u32];
+        pr.st_rep = [[pr.rep[0], pr.rep[1], pr.rep[2], 0]; 2];
         for d in 0..NUM_DIST { pr.dist[d] = dist[d] as u32; }
         pr
     }
@@ -712,27 +719,29 @@ impl Prices {
     fn from_lzma_stats(tokens: &[Tok], input: &[u8]) -> Self {
         fn bits(c: f64, tot: f64) -> u32 { ((-(c / tot).log2()) * 256.0).clamp(8.0, 8192.0) as u32 }
         let mut lit_cnt = [[0u32; 256]; 8];
-        let mut n_lit = [0u32; 8];
-        let mut n_match = [0u32; 8];
-        let mut rep_cnt = [0u32; 5]; // rep0..rep3, normal
+        let mut n_lit = [[0u32; 8]; 2];
+        let mut n_match = [[0u32; 8]; 2];
+        let mut rep_cnt = [[0u32; 5]; 2]; // [state][rep0..rep3, normal]
+        let mut st = 0usize;
         let mut mlen_cnt = vec![0u32; MAX_MATCH + 1];
         let mut rlen_cnt = vec![0u32; MAX_MATCH + 1];
         let mut slot_cnt = [0u32; NUM_DIST_CODES];
         let mut rep = [0u32; 4];
         for t in tokens {
             let c = (t.prev_byte >> 5) as usize;
-            if t.sym < 256 { lit_cnt[c][t.sym as usize] += 1; n_lit[c] += 1; continue; }
-            n_match[c] += 1;
+            if t.sym < 256 { lit_cnt[c][t.sym as usize] += 1; n_lit[st][c] += 1; st = 0; continue; }
+            n_match[st][c] += 1;
             let li = (t.sym - 257) as usize;
             let ml = LEN_CODE_BASE[li] as usize + t.len_extra as usize;
             let md = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra;
             if let Some(k) = rep.iter().position(|&r| r == md && r > 0) {
-                rep_cnt[k] += 1; rlen_cnt[ml] += 1;
+                rep_cnt[st][k] += 1; rlen_cnt[ml] += 1;
                 let d = rep[k]; for q in (1..=k).rev() { rep[q] = rep[q - 1]; } rep[0] = d;
             } else {
-                rep_cnt[4] += 1; mlen_cnt[ml] += 1; slot_cnt[t.dist_code as usize] += 1;
+                rep_cnt[st][4] += 1; mlen_cnt[ml] += 1; slot_cnt[t.dist_code as usize] += 1;
                 rep[3] = rep[2]; rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = md;
             }
+            st = 1;
         }
         fn len_prices(cnt: &[u32]) -> Vec<u32> {
             // LZMA length coder buckets: low 8, mid 8, high 1024
@@ -753,25 +762,29 @@ impl Prices {
         }
         let mlp = len_prices(&mlen_cnt);
         let rlp = len_prices(&rlen_cnt);
-        let n_m: f64 = rep_cnt.iter().sum::<u32>() as f64 + 2.5;
-        let normal = bits(rep_cnt[4] as f64 + 0.5, n_m);
         let mut pr = Prices { lit: [[0; 256]; NUM_CTX], lit_pos: None, mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
-                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [12 * 256; NUM_DIST] };
-        let mut litflag = [0u32; NUM_CTX];
-        for k in 0..3 { pr.rep[k] = bits(rep_cnt[k] as f64 + 0.5, n_m); }
+                              rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [12 * 256; NUM_DIST],
+                              st_lit: [[0; NUM_CTX]; 2], st_match: [[0; NUM_CTX]; 2], st_rep: [[0; 4]; 2] };
+        for s in 0..2 {
+            let n_m: f64 = rep_cnt[s].iter().sum::<u32>() as f64 + 2.5;
+            for k in 0..3 { pr.st_rep[s][k] = bits(rep_cnt[s][k] as f64 + 0.5, n_m); }
+            pr.st_rep[s][3] = bits(rep_cnt[s][4] as f64 + 0.5, n_m);
+            for c in 0..8 {
+                let tot = (n_lit[s][c] + n_match[s][c]) as f64 + 1.0;
+                pr.st_lit[s][c] = bits(n_lit[s][c] as f64 + 0.5, tot);
+                pr.st_match[s][c] = bits(n_match[s][c] as f64 + 0.5, tot);
+            }
+        }
+        let n_lit_c: Vec<u32> = (0..8).map(|c| n_lit[0][c] + n_lit[1][c]).collect();
         let n_s: f64 = slot_cnt.iter().sum::<u32>() as f64;
         for d in 0..NUM_DIST_CODES { pr.dist[d] = bits(slot_cnt[d] as f64 + 0.5, n_s + 0.5 * NUM_DIST_CODES as f64); }
         for c in 0..8 {
-            let tot = (n_lit[c] + n_match[c]) as f64 + 1.0;
-            let p_lit = bits(n_lit[c] as f64 + 0.5, tot);
-            let p_match = bits(n_match[c] as f64 + 0.5, tot);
-            litflag[c] = p_lit;
             for b in 0..256 {
-                pr.lit[c][b] = p_lit + bits(lit_cnt[c][b] as f64 + 0.5, n_lit[c] as f64 + 128.0);
+                pr.lit[c][b] = bits(lit_cnt[c][b] as f64 + 0.5, n_lit_c[c] as f64 + 128.0);
             }
             for l in MIN_MATCH..=MAX_MATCH {
-                pr.mlen[c][l] = p_match + normal + mlp[l];
-                pr.rlen[c][l] = p_match + rlp[l];
+                pr.mlen[c][l] = mlp[l];
+                pr.rlen[c][l] = rlp[l];
             }
         }
         let mut is_lit = vec![false; input.len()];
@@ -784,7 +797,7 @@ impl Prices {
                 if pos < input.len() { match_dist[pos] = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra; }
             }
         }
-        pr.lit_pos = Some((lzma_coder::literal_costs(input, &is_lit, &match_dist, 2), litflag));
+        pr.lit_pos = Some(lzma_coder::literal_costs(input, &is_lit, &match_dist, 2));
         pr
     }
 }
@@ -834,7 +847,8 @@ fn dp_parse(input: &[u8], mm: &MatchArrays, pr: &Prices, lzma: bool) -> Vec<Tok>
             let rep_d2 = dp_rep2_arr[j] as usize;
 
             // Literal
-            let lc = ci + match &pr.lit_pos { Some((lp, lf)) => (lp[i] + lf[ctx]) as u64, None => pr.lit[ctx][input[i] as usize] as u64 };
+            let st = (prev_info[j] >> 63) as usize;
+            let lc = ci + pr.st_lit[st][ctx] as u64 + match &pr.lit_pos { Some(lp) => lp[i] as u64, None => pr.lit[ctx][input[i] as usize] as u64 };
             if lc < cost[j + 1] {
                 cost[j + 1] = lc;
                 prev_info[j + 1] = 0;
@@ -845,7 +859,8 @@ fn dp_parse(input: &[u8], mm: &MatchArrays, pr: &Prices, lzma: bool) -> Vec<Tok>
 
             // Rep-distance match
             let rep_dists = [rep_d, rep_d1, rep_d2];
-            let rep_prices_arr = [pr.rep[0] as u64, pr.rep[1] as u64, pr.rep[2] as u64];
+            let mflag = pr.st_match[st][ctx] as u64;
+            let rep_prices_arr = [pr.st_rep[st][0] as u64 + mflag, pr.st_rep[st][1] as u64 + mflag, pr.st_rep[st][2] as u64 + mflag];
             for rep_slot in 0..3 {
                 let rd = rep_dists[rep_slot];
                 if rd == 0 || rd > i || i + MIN_MATCH > len { continue; }
@@ -891,7 +906,7 @@ fn dp_parse(input: &[u8], mm: &MatchArrays, pr: &Prices, lzma: bool) -> Vec<Tok>
                 if ml < MIN_MATCH { continue; }
                 let md = if slot == 0 { match_md[i] as usize } else { match2_md[i] as usize };
                 let (di, _, db) = dist_to_code(md);
-                let dist_cost = pr.dist[di] as u64 + (db as u64) * 256;
+                let dist_cost = pr.dist[di] as u64 + (db as u64) * 256 + pr.st_rep[st][3] as u64 + mflag;
 
                 let try_lens: &[usize] = if len > 1_000_000 {
                     // Sparse for large files (speed)
