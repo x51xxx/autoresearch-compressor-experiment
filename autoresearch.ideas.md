@@ -4,7 +4,7 @@
 1. **Distance modeling** — distances are 35% (alice) to 59% (franko-berkut) of the LZMA stream. Try: slot ctx = previous slot bucket; model the top 1-2 direct bits of large distances with probs (ctx = slot); bigger rep cache (REP0-REP7) for HTML/RTF tag patterns.
 2. **is_match / literal flag mixing** — is_match ctx is just state x prev>>5. A small mixer over {is_match[state,prev>>5], hashed order-2, order-4 ctx, match-length bucket} like the literal mixer.
 3. **Literal model capacity** — 2nd APM with order-2 ctx; two mixers with different weight-set selectors averaged; sparse/skip contexts (pos-2 only, column for urls); bit-history states instead of simple counters.
-4. **DP fidelity** — third LZMA DP pass (+~10% time); price len/rep flags with the coder's new contexts (prev-length bucket); per-position match prices from a shadow run like literal_costs.
+4. **DP fidelity** — align the word hash in `literal_costs` (incremental, forward FNV) with `lit_ctx` (backward scan): the shadow model prices a word context the real coder does not use; third LZMA DP pass (+~10% time); price len/rep flags with the coder's new contexts (prev-length bucket); per-position match prices from a shadow run like literal_costs.
 5. **Speed recovery** — compress is 2x and decompress 25x slower than at wave start. Pick lc from the 16 KB reverse-check sample instead of trying {0,2}; skip literal mixer hash tables > 2^20 for small files; SIMD mixer dot product; gate the LZMA path (or use 1 shadow pass) above ~10 MB.
 6. **Large-file path** — enwik8 uses ~4 GB RSS (match arrays + literal_costs + tokens). Stream literal_costs per DP block, u16 costs.
 
