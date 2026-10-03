@@ -576,7 +576,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
     output
 }
 
-const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(3, 0, 0), (0, 0, 2), (1, 0, 0), (2, 0, 0), (4, 0, 0), (8, 0, 0), (3, 0, 2), (0, 2, 2)];
+const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)];
 
 fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
                dist_freq: &[u32; NUM_DIST], num_ctx_used: usize, use_ctx: bool,
