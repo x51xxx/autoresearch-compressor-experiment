@@ -298,6 +298,7 @@ const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
 const MIX_LR: i32 = 6;
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
+const APM2_BITS: u32 = 16;
 
 #[inline]
 fn hmix(x: u64, seed: u64) -> u32 {
@@ -344,6 +345,8 @@ struct LitMix {
     hi: [usize; NH],
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
     apm_idx: usize,
+    apm2: Vec<u16>, // [hash(order-2, node)][33 bins]
+    apm2_idx: usize,
 }
 
 impl LitMix {
@@ -377,6 +380,13 @@ impl LitMix {
                 v
             },
             apm_idx: 0,
+            apm2: {
+                let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
+                let mut v = Vec::with_capacity((1 << APM2_BITS) * 33);
+                for _ in 0..(1 << APM2_BITS) { v.extend_from_slice(&row); }
+                v
+            },
+            apm2_idx: 0,
         }
     }
 
@@ -416,7 +426,11 @@ impl LitMix {
         let base = i1 * 33 + lo;
         self.apm_idx = base + (w >> 6) as usize;
         let pa = ((self.apm[base] as i32 * (128 - w) + self.apm[base + 1] as i32 * w) >> 11).clamp(1, 4095);
-        ((self.pr + 3 * pa) >> 2).clamp(1, 4095) as u32
+        let r2 = ((hs[0] ^ node.wrapping_mul(0x9E37_79B1)).wrapping_mul(0x2C1B_3C6D) >> (32 - APM2_BITS)) as usize;
+        let base2 = r2 * 33 + lo;
+        self.apm2_idx = base2 + (w >> 6) as usize;
+        let pa2 = ((self.apm2[base2] as i32 * (128 - w) + self.apm2[base2 + 1] as i32 * w) >> 11).clamp(1, 4095);
+        ((self.pr + 5 * pa + 2 * pa2) >> 3).clamp(1, 4095) as u32
     }
 
     #[inline]
@@ -426,6 +440,8 @@ impl LitMix {
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
         let a = &mut self.apm[self.apm_idx];
+        *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
+        let a = &mut self.apm2[self.apm2_idx];
         *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
         let recip = &self.recip;
         let upd_ctr = |c: &mut Ctr| {
