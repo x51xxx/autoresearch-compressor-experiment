@@ -211,8 +211,8 @@ impl LenModel {
 
 struct Model {
     lc: u32, lp_mask: usize, pb_mask: usize,
-    is_match: Vec<u16>, is_rep: [u16; NUM_STATES], is_rep_g0: [u16; NUM_STATES],
-    is_rep_g1: [u16; NUM_STATES], is_rep_g2: [u16; NUM_STATES],
+    is_match: Vec<u16>, is_rep: [u16; NUM_STATES * LEN_CTX], is_rep_g0: [u16; NUM_STATES * LEN_CTX],
+    is_rep_g1: [u16; NUM_STATES * LEN_CTX], is_rep_g2: [u16; NUM_STATES * LEN_CTX],
     lit: Vec<u16>,
     slot: [[u16; NUM_SLOTS]; NUM_LEN_STATES],
     spec: Vec<Vec<u16>>, // per slot < END_POS_MODEL
@@ -232,8 +232,8 @@ impl Model {
         Model {
             lc: p.lc, lp_mask: (1 << p.lp) - 1, pb_mask: pos_states - 1,
             is_match: vec![PROB_INIT; (NUM_STATES * 8) << p.pb],
-            is_rep: [PROB_INIT; NUM_STATES], is_rep_g0: [PROB_INIT; NUM_STATES],
-            is_rep_g1: [PROB_INIT; NUM_STATES], is_rep_g2: [PROB_INIT; NUM_STATES],
+            is_rep: [PROB_INIT; NUM_STATES * LEN_CTX], is_rep_g0: [PROB_INIT; NUM_STATES * LEN_CTX],
+            is_rep_g1: [PROB_INIT; NUM_STATES * LEN_CTX], is_rep_g2: [PROB_INIT; NUM_STATES * LEN_CTX],
             lit: vec![PROB_INIT; 0x300 << (p.lc + p.lp)],
             slot: [[PROB_INIT; NUM_SLOTS]; NUM_LEN_STATES],
             spec, align: [PROB_INIT; 1 << ALIGN_BITS],
@@ -528,16 +528,16 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
                 e.bit(&mut m.is_match[mctx], 1);
                 let ri = rep.iter().position(|&r| r == dist && r > 0);
                 if let Some(ri) = ri {
-                    e.bit(&mut m.is_rep[state], 1);
+                    e.bit(&mut m.is_rep[state * LEN_CTX + lctx], 1);
                     if ri == 0 {
-                        e.bit(&mut m.is_rep_g0[state], 0);
+                        e.bit(&mut m.is_rep_g0[state * LEN_CTX + lctx], 0);
                     } else {
-                        e.bit(&mut m.is_rep_g0[state], 1);
+                        e.bit(&mut m.is_rep_g0[state * LEN_CTX + lctx], 1);
                         if ri == 1 {
-                            e.bit(&mut m.is_rep_g1[state], 0);
+                            e.bit(&mut m.is_rep_g1[state * LEN_CTX + lctx], 0);
                         } else {
-                            e.bit(&mut m.is_rep_g1[state], 1);
-                            e.bit(&mut m.is_rep_g2[state], (ri == 3) as u32);
+                            e.bit(&mut m.is_rep_g1[state * LEN_CTX + lctx], 1);
+                            e.bit(&mut m.is_rep_g2[state * LEN_CTX + lctx], (ri == 3) as u32);
                         }
                         let d = rep[ri];
                         for k in (1..=ri).rev() { rep[k] = rep[k - 1]; }
@@ -547,7 +547,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
                     lctx = len_bucket(len);
                     state = st_rep(state);
                 } else {
-                    e.bit(&mut m.is_rep[state], 0);
+                    e.bit(&mut m.is_rep[state * LEN_CTX + lctx], 0);
                     m.len.enc(&mut e, len, ps * LEN_CTX + lctx);
                     lctx = len_bucket(len);
                     let ls = (len - MIN_LEN).min(NUM_LEN_STATES - 1);
@@ -597,10 +597,10 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
             continue;
         }
         let len;
-        if d.bit(&mut m.is_rep[state]) == 1 {
-            let ri = if d.bit(&mut m.is_rep_g0[state]) == 0 { 0 }
-                else if d.bit(&mut m.is_rep_g1[state]) == 0 { 1 }
-                else if d.bit(&mut m.is_rep_g2[state]) == 0 { 2 } else { 3 };
+        if d.bit(&mut m.is_rep[state * LEN_CTX + lctx]) == 1 {
+            let ri = if d.bit(&mut m.is_rep_g0[state * LEN_CTX + lctx]) == 0 { 0 }
+                else if d.bit(&mut m.is_rep_g1[state * LEN_CTX + lctx]) == 0 { 1 }
+                else if d.bit(&mut m.is_rep_g2[state * LEN_CTX + lctx]) == 0 { 2 } else { 3 };
             if ri > 0 {
                 let dd = rep[ri];
                 for k in (1..=ri).rev() { rep[k] = rep[k - 1]; }
