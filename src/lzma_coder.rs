@@ -292,6 +292,8 @@ fn squash_i(d: i32) -> i32 {
 struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
 const CTR_LIMIT: u16 = 1020;
+/// Per hashed context (o2, o3, o4, o6, word, sparse, bigram).
+const CTR_LIMIT_HI: [u16; NH] = [1020, 1020, 255, 127, 255, 1020, 127];
 /// Hashed literal contexts: order-2, order-3, order-4, order-6, current word.
 const NH: usize = 7;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
@@ -498,13 +500,13 @@ impl LitMix {
         let a = &mut self.apm2[self.apm2_idx];
         *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
         let recip = &self.recip;
-        let upd_ctr = |c: &mut Ctr| {
+        let upd_ctr = |c: &mut Ctr, lim: u16| {
             let r = recip[c.n as usize];
             c.p = (c.p as i32 + (((target - c.p as i32) * r) >> 16)) as u16;
-            if c.n < CTR_LIMIT { c.n += 1; }
+            if c.n < lim { c.n += 1; }
         };
-        upd_ctr(&mut self.o1[self.i1]);
-        for k in 0..NH { upd_ctr(&mut self.ht[k][self.hi[k]]); }
+        upd_ctr(&mut self.o1[self.i1], CTR_LIMIT);
+        for k in 0..NH { upd_ctr(&mut self.ht[k][self.hi[k]], CTR_LIMIT_HI[k]); }
     }
 }
 
