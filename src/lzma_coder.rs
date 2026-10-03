@@ -293,7 +293,7 @@ fn squash_i(d: i32) -> i32 {
 struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
 const CTR_LIMIT: u16 = 1020;
-const MIX_N: usize = 4;
+const MIX_N: usize = 5;
 const MIX_LR: i32 = 6;
 const MIX_SHIFT: u32 = 14;
 
@@ -303,6 +303,7 @@ struct LitMix {
     recip: [i32; 1024],
     o1: Vec<Ctr>,
     o2: Vec<Ctr>,
+    o3: Vec<Ctr>,
     o2_mask: usize,
     w: Vec<[i32; MIX_N]>,
     st: [i32; MIX_N],
@@ -310,6 +311,7 @@ struct LitMix {
     set: usize,
     i1: usize,
     i2: usize,
+    i3: usize,
 }
 
 impl LitMix {
@@ -330,9 +332,10 @@ impl LitMix {
             squash, stretch, recip,
             o1: vec![CTR_INIT; 1 << 16],
             o2: vec![CTR_INIT; 1 << o2_bits],
+            o3: vec![CTR_INIT; 1 << o2_bits],
             o2_mask: (1 << o2_bits) - 1,
-            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 0]; 16],
-            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0,
+            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 0]; 16],
+            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0, i3: 0,
         }
     }
 
@@ -340,12 +343,13 @@ impl LitMix {
     fn sq(&self, d: i32) -> i32 { self.squash[(d.clamp(-2047, 2047) + 2048) as usize] }
 
     #[inline]
-    fn predict(&mut self, lz_p1: u32, i1: usize, i2: usize, set: usize) -> u32 {
-        self.i1 = i1; self.i2 = i2 & self.o2_mask; self.set = set;
+    fn predict(&mut self, lz_p1: u32, i1: usize, i2: usize, i3: usize, set: usize) -> u32 {
+        self.i1 = i1; self.i2 = i2 & self.o2_mask; self.i3 = i3 & self.o2_mask; self.set = set;
         self.st = [
             self.stretch[lz_p1.clamp(1, 4095) as usize],
             self.stretch[(self.o1[self.i1].p >> 4) as usize],
             self.stretch[(self.o2[self.i2].p >> 4) as usize],
+            self.stretch[(self.o3[self.i3].p >> 4) as usize],
             256,
         ];
         let w = &self.w[set];
@@ -361,7 +365,7 @@ impl LitMix {
         let w = &mut self.w[self.set];
         for k in 0..MIX_N { w[k] += (self.st[k] * err) >> MIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
-        for c in [&mut self.o1[self.i1], &mut self.o2[self.i2]] {
+        for c in [&mut self.o1[self.i1], &mut self.o2[self.i2], &mut self.o3[self.i3]] {
             let r = self.recip[c.n as usize];
             c.p = (c.p as i32 + (((target - c.p as i32) * r) >> 16)) as u16;
             if c.n < CTR_LIMIT { c.n += 1; }
@@ -370,9 +374,10 @@ impl LitMix {
 }
 
 /// Code one literal (encode `byte`, or decode and return it). `matched`: byte at rep0 after a match.
-fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev: u8, prev2: u8, matched: Option<u32>) -> u8 {
-    let h1 = (prev as usize) << 8;
-    let h2 = (((prev2 as u32) << 8 | prev as u32).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
+fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist: u32, matched: Option<u32>) -> u8 {
+    let h1 = ((hist & 0xFF) as usize) << 8;
+    let h2 = ((hist & 0xFFFF).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
+    let h3 = ((hist & 0xFF_FFFF).wrapping_mul(0x2545_F491).rotate_left(13).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
     let mut node = 1u32;
     let mut offs = 0x100u32;
     let mut mb = matched.unwrap_or(0);
@@ -380,7 +385,7 @@ fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, prev:
     for k in (0..8).rev() {
         let lz_idx = if matched.is_some() { mb <<= 1; offs + (mb & offs) + node } else { node } as usize;
         let lz_p1 = (1u32 << PROB_BITS) - m.lit[base + lz_idx] as u32;
-        let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, mset + 7 - k);
+        let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, h3 + node as usize, mset + 7 - k);
         let bit = io.code(p, (byte >> k) & 1);
         upd(&mut m.lit[base + lz_idx], bit);
         m.mix.update(bit);
@@ -405,10 +410,10 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
             Op::Lit(b) => {
                 e.bit(&mut m.is_match[(state << p.pb) + ps], 0);
                 let prev = if pos > 0 { input[pos - 1] } else { 0 };
-                let prev2 = if pos > 1 { input[pos - 2] } else { 0 };
+                let hist = (prev as u32) | (if pos > 1 { input[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { input[pos - 3] as u32 } else { 0 }) << 16;
                 let base = m.lit_base(pos, prev);
                 let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
-                code_lit(&mut e, &mut m, b as u32, base, prev, prev2, matched);
+                code_lit(&mut e, &mut m, b as u32, base, hist, matched);
                 state = st_lit(state);
                 pos += 1;
             }
@@ -474,10 +479,10 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
         let ps = pos & m.pb_mask;
         if d.bit(&mut m.is_match[(state << p.pb) + ps]) == 0 {
             let prev = if pos > 0 { out[pos - 1] } else { 0 };
-            let prev2 = if pos > 1 { out[pos - 2] } else { 0 };
+            let hist = (prev as u32) | (if pos > 1 { out[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { out[pos - 3] as u32 } else { 0 }) << 16;
             let base = m.lit_base(pos, prev);
             let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
-            let sym = code_lit(&mut d, &mut m, 0, base, prev, prev2, matched);
+            let sym = code_lit(&mut d, &mut m, 0, base, hist, matched);
             out.push(sym as u8);
             state = st_lit(state);
             continue;
