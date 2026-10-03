@@ -307,7 +307,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
         // Match arrays (match_ml etc.) are full-file; DP arrays are block-scoped.
         // Matches still reference the full window (8MB); only DP state is local.
         let mm = MatchArrays { ml: match_ml, md: match_md, ml2: match2_ml, md2: match2_md };
-        let num_dp_passes = if len > 500_000 { 2 } else { 4 };
+        let num_dp_passes = 2;
 
         for iteration in 0..num_dp_passes {
             let pr = Prices::from_huffman(&ll_prices, &dist_prices);
@@ -577,7 +577,7 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
     output
 }
 
-const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(0, 0, 0), (2, 0, 0), (3, 0, 0)];
+const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(0, 0, 0), (2, 0, 0)];
 
 fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
                dist_freq: &[u32; NUM_DIST], num_ctx_used: usize, use_ctx: bool,
