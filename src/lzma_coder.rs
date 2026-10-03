@@ -310,14 +310,15 @@ fn hmix(x: u64, seed: u64) -> u32 {
 fn lit_ctx(buf: &[u8], pos: usize) -> [u32; NH] {
     let mut h8 = 0u64;
     for k in 1..=8usize.min(pos) { h8 |= (buf[pos - k] as u64) << (8 * (k - 1)); }
-    let mut w = 0u64;
+    // word start (at most 32 letters back), then hash forward like literal_costs does
     let mut k = pos;
     while k > 0 && pos - k < 32 {
         let b = buf[k - 1];
         if !(b.is_ascii_alphabetic() || b >= 0x80) { break; }
-        w = (w ^ b as u64).wrapping_mul(0x100_0000_01B3);
         k -= 1;
     }
+    let mut w = 0u64;
+    for &b in &buf[k..pos] { w = (w ^ b as u64).wrapping_mul(0x100_0000_01B3); }
     ctx_from(h8, w)
 }
 
