@@ -16,6 +16,7 @@ mod context;
 pub mod rans;
 pub mod range_coder;
 pub mod suffix_array;
+pub mod lzma_coder;
 
 // Checksum function — swap between crc32, adler32, xxhash32
 use checksum::xxhash32 as integrity_hash;
@@ -691,12 +692,39 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
         let rans_output = encode_rans(&tokens, &litlen_freq, &dist_freq, num_ctx_used, use_ctx,
                                        end_ctx, len, window_log2, input);
         if rans_output.len() < output.len() {
-            return rans_output;
+            output = rans_output;
+        }
+    }
+
+    // Try the adaptive LZMA-style backend (no table header), several lc/lp/pb settings.
+    let ops: Vec<lzma_coder::Op> = tokens.iter().map(|t| {
+        if t.sym < 256 { lzma_coder::Op::Lit(t.sym as u8) } else {
+            let li = (t.sym - 257) as usize;
+            let ml = LEN_CODE_BASE[li] as u32 + t.len_extra as u32;
+            let md = DIST_CODE_BASE[t.dist_code as usize] + t.dist_extra;
+            lzma_coder::Op::Match(ml, md)
+        }
+    }).collect();
+    for &(lc, lp, pb) in LZMA_PARAM_SETS {
+        let params = lzma_coder::Params { lc, lp, pb };
+        let body = lzma_coder::encode(&ops, input, &params);
+        if 19 + body.len() < output.len() {
+            let mut o = Vec::with_capacity(19 + body.len());
+            o.extend_from_slice(&(len as u64).to_le_bytes());
+            o.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+            o.push(0x20); // bit 5 = LZMA backend
+            o.extend_from_slice(&integrity_hash(input).to_le_bytes());
+            o.push(window_log2);
+            o.push((lc | (lp << 4) | (pb << 6)) as u8);
+            o.extend_from_slice(&body);
+            output = o;
         }
     }
 
     output
 }
+
+const LZMA_PARAM_SETS: &[(u32, u32, u32)] = &[(3, 0, 0), (0, 0, 2), (1, 0, 0), (2, 0, 0), (4, 0, 0), (8, 0, 0), (3, 0, 2), (0, 2, 2)];
 
 fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
                dist_freq: &[u32; NUM_DIST], num_ctx_used: usize, use_ctx: bool,
@@ -830,7 +858,17 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, String> {
     let raw_ctx_byte = compressed[12];
     let is_reversed = raw_ctx_byte & 0x80 != 0;
     let use_rans = raw_ctx_byte & 0x40 != 0;
-    let num_ctx_used = (raw_ctx_byte & 0x3F) as usize;
+    let num_ctx_used = (raw_ctx_byte & 0x1F) as usize;
+    if raw_ctx_byte & 0x20 != 0 {
+        if compressed.len() < 19 { return Err("truncated lzma header".into()); }
+        let expected = u32::from_le_bytes(compressed[13..17].try_into().unwrap());
+        let pbyte = compressed[18] as u32;
+        let params = lzma_coder::Params { lc: pbyte & 0xF, lp: (pbyte >> 4) & 3, pb: pbyte >> 6 };
+        let mut out = lzma_coder::decode(&compressed[19..], orig_len, &params)?;
+        if integrity_hash(&out) != expected { return Err("lzma: checksum mismatch".into()); }
+        if is_reversed { out.reverse(); }
+        return Ok(out);
+    }
     if num_ctx_used != 1 && num_ctx_used != NUM_CTX {
         return Err(format!("invalid num_ctx_used: {}", num_ctx_used));
     }
