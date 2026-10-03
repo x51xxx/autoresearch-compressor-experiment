@@ -374,7 +374,7 @@ impl LitMix {
 }
 
 /// Code one literal (encode `byte`, or decode and return it). `matched`: byte at rep0 after a match.
-fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist: u32, matched: Option<u32>) -> u8 {
+fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist: u32, matched: Option<u32>, update: bool) -> u8 {
     let h1 = ((hist & 0xFF) as usize) << 8;
     let h2 = ((hist & 0xFFFF).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
     let h3 = ((hist & 0xFF_FFFF).wrapping_mul(0x2545_F491).rotate_left(13).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
@@ -387,12 +387,45 @@ fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist:
         let lz_p1 = (1u32 << PROB_BITS) - m.lit[base + lz_idx] as u32;
         let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, h3 + node as usize, mset + 7 - k);
         let bit = io.code(p, (byte >> k) & 1);
-        upd(&mut m.lit[base + lz_idx], bit);
-        m.mix.update(bit);
+        if update {
+            upd(&mut m.lit[base + lz_idx], bit);
+            m.mix.update(bit);
+        }
         if matched.is_some() { let mbit = mb & offs; if bit == 0 { offs &= !mbit; } else { offs &= mbit; } }
         node = (node << 1) | bit;
     }
     node as u8
+}
+
+/// Accumulates the cost (8.8 fixed-point bits) of coding bits instead of coding them.
+struct CostIO { cost: u32, table: Vec<u32> }
+impl BitIO for CostIO {
+    #[inline]
+    fn code(&mut self, p1: u32, bit: u32) -> u32 {
+        self.cost += self.table[if bit != 0 { p1 } else { 4096 - p1 } as usize];
+        bit
+    }
+}
+
+/// Per-position literal cost under the adaptive literal model (no matched-literal side info).
+/// The model is trained only on positions flagged in `is_lit` (the literals of a previous parse),
+/// but every position is priced, so the DP sees context-specific literal costs.
+pub fn literal_costs(input: &[u8], is_lit: &[bool], lc: u32) -> Vec<u32> {
+    let p = Params { lc, lp: 0, pb: 0 };
+    let mut m = Model::new(&p, input.len());
+    let table: Vec<u32> = (0..=4096u32).map(|q| if q == 0 { 4096 * 4 } else { (-(q as f64 / 4096.0).log2() * 256.0) as u32 }).collect();
+    let mut io = CostIO { cost: 0, table };
+    let mut out = vec![0u32; input.len()];
+    let mut hist = 0u32;
+    for i in 0..input.len() {
+        let prev = (hist & 0xFF) as u8;
+        let base = m.lit_base(i, prev);
+        io.cost = 0;
+        code_lit(&mut io, &mut m, input[i] as u32, base, hist & 0xFF_FFFF, None, is_lit[i]);
+        out[i] = io.cost;
+        hist = (hist << 8) | input[i] as u32;
+    }
+    out
 }
 
 // ---------------------------------------------------------------- encode / decode
@@ -413,7 +446,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
                 let hist = (prev as u32) | (if pos > 1 { input[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { input[pos - 3] as u32 } else { 0 }) << 16;
                 let base = m.lit_base(pos, prev);
                 let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
-                code_lit(&mut e, &mut m, b as u32, base, hist, matched);
+                code_lit(&mut e, &mut m, b as u32, base, hist, matched, true);
                 state = st_lit(state);
                 pos += 1;
             }
@@ -482,7 +515,7 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
             let hist = (prev as u32) | (if pos > 1 { out[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { out[pos - 3] as u32 } else { 0 }) << 16;
             let base = m.lit_base(pos, prev);
             let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
-            let sym = code_lit(&mut d, &mut m, 0, base, hist, matched);
+            let sym = code_lit(&mut d, &mut m, 0, base, hist, matched, true);
             out.push(sym as u8);
             state = st_lit(state);
             continue;

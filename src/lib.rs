@@ -382,9 +382,9 @@ pub fn compress_inner(input: &[u8], window_size: usize) -> Vec<u8> {
             }
         }
         // Extra DP pass priced for the adaptive LZMA backend (stats from the Huffman parse).
-        let lz_pr = Prices::from_lzma_stats(&tokens);
+        let lz_pr = Prices::from_lzma_stats(&tokens, input);
         lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
-        let lz_pr = Prices::from_lzma_stats(&lzma_tokens);
+        let lz_pr = Prices::from_lzma_stats(&lzma_tokens, input);
         lzma_tokens = dp_parse(input, &mm, &lz_pr, true);
     } else {
         let mut prev_byte: u8 = 0;
@@ -682,6 +682,8 @@ fn encode_rans(tokens: &[Tok], litlen_freq: &[[u32; NUM_LITLEN]; NUM_CTX],
 /// Per-pass price tables for the DP (8.8 fixed-point bits).
 struct Prices {
     lit: [[u32; 256]; NUM_CTX],
+    /// Optional per-position literal cost (adaptive model) + per-ctx literal flag cost.
+    lit_pos: Option<(Vec<u32>, [u32; NUM_CTX])>,
     mlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a normal match (incl. flags)
     rlen: Vec<[u32; MAX_MATCH + 1]>, // per ctx: length part of a rep match (incl. flags)
     rep: [u32; 3],
@@ -690,7 +692,7 @@ struct Prices {
 
 impl Prices {
     fn from_huffman(ll: &[[u16; NUM_LITLEN]; NUM_CTX], dist: &[u16; NUM_DIST]) -> Self {
-        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
+        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], lit_pos: None, mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
                               rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [0; NUM_DIST] };
         for c in 0..NUM_CTX {
             for b in 0..256 { pr.lit[c][b] = ll[c][b] as u32; }
@@ -706,7 +708,7 @@ impl Prices {
     }
 
     /// Static approximation of the adaptive LZMA backend's costs, estimated from a parse.
-    fn from_lzma_stats(tokens: &[Tok]) -> Self {
+    fn from_lzma_stats(tokens: &[Tok], input: &[u8]) -> Self {
         fn bits(c: f64, tot: f64) -> u32 { ((-(c / tot).log2()) * 256.0).clamp(8.0, 8192.0) as u32 }
         let mut lit_cnt = [[0u32; 256]; 8];
         let mut n_lit = [0u32; 8];
@@ -752,8 +754,9 @@ impl Prices {
         let rlp = len_prices(&rlen_cnt);
         let n_m: f64 = rep_cnt.iter().sum::<u32>() as f64 + 2.5;
         let normal = bits(rep_cnt[4] as f64 + 0.5, n_m);
-        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
+        let mut pr = Prices { lit: [[0; 256]; NUM_CTX], lit_pos: None, mlen: vec![[0; MAX_MATCH + 1]; NUM_CTX],
                               rlen: vec![[0; MAX_MATCH + 1]; NUM_CTX], rep: [0; 3], dist: [12 * 256; NUM_DIST] };
+        let mut litflag = [0u32; NUM_CTX];
         for k in 0..3 { pr.rep[k] = bits(rep_cnt[k] as f64 + 0.5, n_m); }
         let n_s: f64 = slot_cnt.iter().sum::<u32>() as f64;
         for d in 0..NUM_DIST_CODES { pr.dist[d] = bits(slot_cnt[d] as f64 + 0.5, n_s + 0.5 * NUM_DIST_CODES as f64); }
@@ -761,6 +764,7 @@ impl Prices {
             let tot = (n_lit[c] + n_match[c]) as f64 + 1.0;
             let p_lit = bits(n_lit[c] as f64 + 0.5, tot);
             let p_match = bits(n_match[c] as f64 + 0.5, tot);
+            litflag[c] = p_lit;
             for b in 0..256 {
                 pr.lit[c][b] = p_lit + bits(lit_cnt[c][b] as f64 + 0.5, n_lit[c] as f64 + 128.0);
             }
@@ -769,6 +773,13 @@ impl Prices {
                 pr.rlen[c][l] = p_match + rlp[l];
             }
         }
+        let mut is_lit = vec![false; input.len()];
+        let mut pos = 0usize;
+        for t in tokens {
+            if t.sym < 256 { is_lit[pos] = true; pos += 1; }
+            else { pos += LEN_CODE_BASE[(t.sym - 257) as usize] as usize + t.len_extra as usize; }
+        }
+        pr.lit_pos = Some((lzma_coder::literal_costs(input, &is_lit, 2), litflag));
         pr
     }
 }
@@ -818,7 +829,7 @@ fn dp_parse(input: &[u8], mm: &MatchArrays, pr: &Prices, lzma: bool) -> Vec<Tok>
             let rep_d2 = dp_rep2_arr[j] as usize;
 
             // Literal
-            let lc = ci + pr.lit[ctx][input[i] as usize] as u64;
+            let lc = ci + match &pr.lit_pos { Some((lp, lf)) => (lp[i] + lf[ctx]) as u64, None => pr.lit[ctx][input[i] as usize] as u64 };
             if lc < cost[j + 1] {
                 cost[j + 1] = lc;
                 prev_info[j + 1] = 0;
