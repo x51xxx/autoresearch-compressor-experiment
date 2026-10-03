@@ -463,6 +463,8 @@ struct MatchMix {
     i_o4: usize,
     i_run: usize,
     i_lctx: usize,
+    apm: Vec<u16>,
+    apm_idx: usize,
 }
 
 impl MatchMix {
@@ -504,6 +506,13 @@ impl MatchMix {
             i_o4: 0,
             i_run: 0,
             i_lctx: 0,
+            apm: {
+                let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
+                let mut v = Vec::with_capacity(256 * 33);
+                for _ in 0..256 { v.extend_from_slice(&row); }
+                v
+            },
+            apm_idx: 0,
         }
     }
 
@@ -533,7 +542,14 @@ impl MatchMix {
         let mut dot: i64 = 0;
         for k in 0..MMIX_N { dot += self.st[k] as i64 * w[k] as i64; }
         self.pr = self.sq((dot >> 16) as i32).clamp(1, 4095);
-        self.pr as u32
+
+        let sv = self.stretch[self.pr as usize] + 2048;
+        let lo = (sv >> 7) as usize;
+        let w_val = sv & 127;
+        let base = (prev as usize) * 33 + lo;
+        self.apm_idx = base + (w_val >> 6) as usize;
+        let pa = ((self.apm[base] as i32 * (128 - w_val) + self.apm[base + 1] as i32 * w_val) >> 11).clamp(1, 4095);
+        ((self.pr + 3 * pa) >> 2).clamp(1, 4095) as u32
     }
 
     #[inline]
@@ -542,6 +558,8 @@ impl MatchMix {
         let w = &mut self.w[self.set];
         for k in 0..MMIX_N { w[k] += (self.st[k] * err) >> MMIX_SHIFT; }
         let target = if bit != 0 { 65535 } else { 0 };
+        let a = &mut self.apm[self.apm_idx];
+        *a = (*a as i32 + ((target - *a as i32) >> 5)) as u16;
         let recip = &self.recip;
         let upd_ctr = |c: &mut Ctr| {
             let r = recip[c.n as usize];
