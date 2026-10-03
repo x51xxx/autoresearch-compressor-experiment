@@ -293,7 +293,7 @@ struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
 const CTR_LIMIT: u16 = 1020;
 /// Hashed literal contexts: order-2, order-3, order-4, order-6, current word.
-const NH: usize = 6;
+const NH: usize = 7;
 const MIX_N: usize = NH + 3; // LZMA lit prob, order-1, hashed..., bias
 const MIX_LR: i32 = 4;
 const FIN_LR: i32 = 2;
@@ -335,9 +335,10 @@ impl Ctx {
 #[inline]
 fn ctx_from(h8: u64, w: u64, pw: u64) -> [u32; NH] {
     let w = if w == 0 { 0x5555 + (h8 & 0xFF) } else { w };
-    let _ = pw;
+
     [hmix(h8 & 0xFFFF, 2), hmix(h8 & 0xFF_FFFF, 3), hmix(h8 & 0xFFFF_FFFF, 4),
-     hmix(h8 & 0xFFFF_FFFF_FFFF, 6), hmix(w, 7), hmix(h8 & 0xFF_FF00, 8)]
+     hmix(h8 & 0xFFFF_FFFF_FFFF, 6), hmix(w, 7), hmix(h8 & 0xFF_FF00, 8),
+     hmix(w ^ pw.rotate_left(29), 10)]
 }
 
 struct LitMix {
