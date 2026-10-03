@@ -11,16 +11,21 @@ Optimize a pure Rust LZ77+Huffman compressor for compression ratio (primary). 12
 `./autoresearch.sh`
 
 ## Current Best
-**Ratio: 0.2245** — beats gzip-9 (0.303) by 25.9%, beats zstd-19 (0.226) by 0.8%, beats brotli-6 (0.242) by 7.2%. Loses to brotli-11 (0.217).
+**Ratio: 0.220861** (wave 4 baseline, commit ba72f50) — compress 3.94 s, decompress 14.8 ms for the 12-file corpus.
+Beats gzip-9 (0.303) by 27%, zstd-19 (0.226). Loses to brotli-11 (~0.217).
+
+## Wave 4 protocol (segment 3 in autoresearch.jsonl)
+edit → `./autoresearch.sh` → `./autoresearch.checks.sh` → keep = git commit / discard = `git checkout -- src` → append jsonl line → update this file.
+Keep rule: ratio must improve; compress_µs must not grow by more than 25%. Decompress speed is reported, not gated.
 
 ## Architecture
-- **Match finder**: 4/5-byte adaptive hash chain + 8-byte secondary hash. MAX_CHAIN=8192.
-- **Optimal parse**: Forward DP, 6 passes, hybrid pricing (entropy→Huffman). Dense try_lens 3-64. Fractional 8.8 fixed-point prices.
-- **Rep-offsets**: REP0-REP3 in distance alphabet. DP tracks REP0+REP1+REP2. Dense rep try_lens 3-16.
-- **Context**: 8 byte classes. Adaptive selection (entropy-based). Per-context Huffman.
-- **Window**: Dynamic 1KB-1MB. Distance codes extended to 40 (up from 36).
-- **Header**: Nibble-packed RLE code lengths. xxhash32 integrity.
-- **Reverse**: 16KB sample pre-check, try both directions.
+- **Match finder**: suffix array (files < 1 MB, scan range 32) + hash chain (4/5-byte hash; chain 16/64/32 by size, early abort at 128). Two match slots (longest + nearest) feed the DP.
+- **Optimal parse**: forward DP in 256 KB blocks; 4 passes (<500 KB) or 2 passes; entropy prices early, Huffman lengths in the last pass; 8.8 fixed-point prices. Dense try_lens 3-32 (+43,67,131,258,515) for <1 MB.
+- **Rep-offsets**: REP0-REP3 in the distance alphabet; DP tracks REP0-REP2 with hardcoded 2/3/4-bit prices.
+- **Context**: 9 byte classes (prev byte), adaptive 1 vs 9 tables by entropy estimate.
+- **Window**: 8 MB max (power-of-two of file size), 46 distance codes + 4 REP symbols, MAX_MATCH 1026.
+- **Entropy coding**: Huffman (nibble-packed RLE header) and rANS (sparse 14-bit freq header, 100 KB–2 MB files) — try both, keep smaller.
+- **Reverse**: 16 KB sample pre-check, try both directions. xxhash32 integrity.
 
 ## What Would Break Through
 To beat brotli-11 (0.217) requires structural changes:
