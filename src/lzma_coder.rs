@@ -369,6 +369,8 @@ struct LitMix {
     apm_idx: usize, apm_w: i32,
     apm2: Vec<u16>, // [hash(order-2, node)][33 bins]
     apm2_idx: usize,
+    apm3: Vec<u16>, // [hash(word, node)][33 bins]
+    apm3_idx: usize,
 }
 
 impl LitMix {
@@ -411,6 +413,13 @@ impl LitMix {
                 v
             },
             apm2_idx: 0,
+            apm3: {
+                let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
+                let mut v = Vec::with_capacity((1 << APM2_BITS) * 33);
+                for _ in 0..(1 << APM2_BITS) { v.extend_from_slice(&row); }
+                v
+            },
+            apm3_idx: 0,
         }
     }
 
@@ -484,7 +493,11 @@ impl LitMix {
         let base2 = r2 * 33 + lo;
         self.apm2_idx = base2;
         let pa2 = ((self.apm2[base2] as i32 * (128 - w) + self.apm2[base2 + 1] as i32 * w) >> 11).clamp(1, 4095);
-        ((self.pr + 5 * pa + 2 * pa2) >> 3).clamp(1, 4095) as u32
+        let r3 = ((hs[4] ^ node.wrapping_mul(0x9E37_79B1)).wrapping_mul(0x2C1B_3C6D) >> (32 - APM2_BITS)) as usize;
+        let base3 = r3 * 33 + lo;
+        self.apm3_idx = base3;
+        let pa3 = ((self.apm3[base3] as i32 * (128 - w) + self.apm3[base3 + 1] as i32 * w) >> 11).clamp(1, 4095);
+        ((self.pr + 3 * pa + 2 * pa2 + 2 * pa3) >> 3).clamp(1, 4095) as u32
     }
 
     #[inline]
@@ -502,7 +515,7 @@ impl LitMix {
         let target = if bit != 0 { 65535 } else { 0 };
         // update both interpolation bins, each in proportion to its weight
         let (wl, wh) = (128 - self.apm_w, self.apm_w);
-        for (t, i) in [(&mut self.apm, self.apm_idx), (&mut self.apm2, self.apm2_idx)] {
+        for (t, i) in [(&mut self.apm, self.apm_idx), (&mut self.apm2, self.apm2_idx), (&mut self.apm3, self.apm3_idx)] {
             let a = &mut t[i];
             *a = (*a as i32 + (((target - *a as i32) * wl) >> (APM_RATE + 6))) as u16;
             let a = &mut t[i + 1];
