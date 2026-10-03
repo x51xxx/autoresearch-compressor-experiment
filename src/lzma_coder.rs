@@ -293,7 +293,7 @@ fn squash_i(d: i32) -> i32 {
 struct Ctr { p: u16, n: u16 }
 const CTR_INIT: Ctr = Ctr { p: 32768, n: 0 };
 const CTR_LIMIT: u16 = 1020;
-const MIX_N: usize = 5;
+const MIX_N: usize = 6;
 const MIX_LR: i32 = 6;
 const MIX_SHIFT: u32 = 14;
 const APM_RATE: u32 = 7;
@@ -305,6 +305,7 @@ struct LitMix {
     o1: Vec<Ctr>,
     o2: Vec<Ctr>,
     o3: Vec<Ctr>,
+    o4: Vec<Ctr>,
     o2_mask: usize,
     w: Vec<[i32; MIX_N]>,
     st: [i32; MIX_N],
@@ -313,6 +314,7 @@ struct LitMix {
     i1: usize,
     i2: usize,
     i3: usize,
+    i4: usize,
     apm: Vec<u16>, // [prev byte][node][33 bins], P(1) 16-bit
     apm_idx: usize,
 }
@@ -336,9 +338,10 @@ impl LitMix {
             o1: vec![CTR_INIT; 1 << 16],
             o2: vec![CTR_INIT; 1 << o2_bits],
             o3: vec![CTR_INIT; 1 << o2_bits],
+            o4: vec![CTR_INIT; 1 << o2_bits],
             o2_mask: (1 << o2_bits) - 1,
-            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 0]; 16 * 9],
-            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0, i3: 0,
+            w: vec![[65536 / 2, 65536 / 4, 65536 / 4, 65536 / 4, 65536 / 8, 0]; 16 * 9],
+            st: [0; MIX_N], pr: 2048, set: 0, i1: 0, i2: 0, i3: 0, i4: 0,
             apm: {
                 let row: Vec<u16> = (0..33).map(|j| (squash_i((j - 16) * 128) * 16) as u16).collect();
                 let mut v = Vec::with_capacity(65536 * 33);
@@ -353,13 +356,14 @@ impl LitMix {
     fn sq(&self, d: i32) -> i32 { self.squash[(d.clamp(-2047, 2047) + 2048) as usize] }
 
     #[inline]
-    fn predict(&mut self, lz_p1: u32, i1: usize, i2: usize, i3: usize, set: usize) -> u32 {
-        self.i1 = i1; self.i2 = i2 & self.o2_mask; self.i3 = i3 & self.o2_mask; self.set = set;
+    fn predict(&mut self, lz_p1: u32, i1: usize, i2: usize, i3: usize, i4: usize, set: usize) -> u32 {
+        self.i1 = i1; self.i2 = i2 & self.o2_mask; self.i3 = i3 & self.o2_mask; self.i4 = i4 & self.o2_mask; self.set = set;
         self.st = [
             self.stretch[lz_p1.clamp(1, 4095) as usize],
             self.stretch[(self.o1[self.i1].p >> 4) as usize],
             self.stretch[(self.o2[self.i2].p >> 4) as usize],
             self.stretch[(self.o3[self.i3].p >> 4) as usize],
+            self.stretch[(self.o4[self.i4].p >> 4) as usize],
             256,
         ];
         let n2 = self.o2[self.i2].n; let n3 = self.o3[self.i3].n;
@@ -387,7 +391,7 @@ impl LitMix {
         let target = if bit != 0 { 65535 } else { 0 };
         let a = &mut self.apm[self.apm_idx];
         *a = (*a as i32 + ((target - *a as i32) >> APM_RATE)) as u16;
-        for c in [&mut self.o1[self.i1], &mut self.o2[self.i2], &mut self.o3[self.i3]] {
+        for c in [&mut self.o1[self.i1], &mut self.o2[self.i2], &mut self.o3[self.i3], &mut self.o4[self.i4]] {
             let r = self.recip[c.n as usize];
             c.p = (c.p as i32 + (((target - c.p as i32) * r) >> 16)) as u16;
             if c.n < CTR_LIMIT { c.n += 1; }
@@ -400,6 +404,7 @@ fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist:
     let h1 = ((hist & 0xFF) as usize) << 8;
     let h2 = ((hist & 0xFFFF).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
     let h3 = ((hist & 0xFF_FFFF).wrapping_mul(0x2545_F491).rotate_left(13).wrapping_mul(0x9E37_79B1) >> 8) as usize * 256;
+    let h4 = (hist.wrapping_mul(0x8510_7A35).rotate_left(17).wrapping_mul(0x2545_F491) >> 8) as usize * 256;
     let mut node = 1u32;
     let mut offs = 0x100u32;
     let mut mb = matched.unwrap_or(0);
@@ -407,7 +412,7 @@ fn code_lit<IO: BitIO>(io: &mut IO, m: &mut Model, byte: u32, base: usize, hist:
     for k in (0..8).rev() {
         let lz_idx = if matched.is_some() { mb <<= 1; offs + (mb & offs) + node } else { node } as usize;
         let lz_p1 = (1u32 << PROB_BITS) - m.lit[base + lz_idx] as u32;
-        let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, h3 + node as usize, mset + 7 - k);
+        let p = m.mix.predict(lz_p1, h1 + node as usize, h2 + node as usize, h3 + node as usize, h4 + node as usize, mset + 7 - k);
         let bit = io.code(p, (byte >> k) & 1);
         if update {
             upd(&mut m.lit[base + lz_idx], bit);
@@ -447,7 +452,7 @@ pub fn literal_costs(input: &[u8], is_lit: &[bool], match_dist: &[u32], lc: u32)
         io.cost = 0;
         let md = match_dist[i] as usize;
         let matched = if md > 0 && md <= i { Some(input[i - md] as u32) } else { None };
-        code_lit(&mut io, &mut m, input[i] as u32, base, hist & 0xFF_FFFF, matched, is_lit[i]);
+        code_lit(&mut io, &mut m, input[i] as u32, base, hist, matched, is_lit[i]);
         out[i] = io.cost;
         hist = (hist << 8) | input[i] as u32;
     }
@@ -469,7 +474,7 @@ pub fn encode(ops: &[Op], input: &[u8], p: &Params) -> Vec<u8> {
             Op::Lit(b) => {
                 e.bit(&mut m.is_match[(state << p.pb) + ps], 0);
                 let prev = if pos > 0 { input[pos - 1] } else { 0 };
-                let hist = (prev as u32) | (if pos > 1 { input[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { input[pos - 3] as u32 } else { 0 }) << 16;
+                let hist = (prev as u32) | (if pos > 1 { input[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { input[pos - 3] as u32 } else { 0 }) << 16 | (if pos > 3 { input[pos - 4] as u32 } else { 0 }) << 24;
                 let base = m.lit_base(pos, prev);
                 let matched = if state >= 7 { Some(input[pos - rep[0] as usize] as u32) } else { None };
                 code_lit(&mut e, &mut m, b as u32, base, hist, matched, true);
@@ -538,7 +543,7 @@ pub fn decode(data: &[u8], orig_len: usize, p: &Params) -> Result<Vec<u8>, Strin
         let ps = pos & m.pb_mask;
         if d.bit(&mut m.is_match[(state << p.pb) + ps]) == 0 {
             let prev = if pos > 0 { out[pos - 1] } else { 0 };
-            let hist = (prev as u32) | (if pos > 1 { out[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { out[pos - 3] as u32 } else { 0 }) << 16;
+            let hist = (prev as u32) | (if pos > 1 { out[pos - 2] as u32 } else { 0 }) << 8 | (if pos > 2 { out[pos - 3] as u32 } else { 0 }) << 16 | (if pos > 3 { out[pos - 4] as u32 } else { 0 }) << 24;
             let base = m.lit_base(pos, prev);
             let matched = if state >= 7 { Some(out[pos - rep[0] as usize] as u32) } else { None };
             let sym = code_lit(&mut d, &mut m, 0, base, hist, matched, true);
